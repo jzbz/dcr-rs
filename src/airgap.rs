@@ -113,6 +113,15 @@ pub struct SignRequest {
     /// Outputs of the transaction.
     #[n(6)]
     pub outputs: Vec<OutputMeta>,
+    /// OPTIONAL (additive; the format stays v1 — 7-element packages decode
+    /// with `None`): BIP32 fingerprint of the ACCOUNT key this request was
+    /// built against (first 4 bytes of hash160 of the account's compressed
+    /// pubkey). Lets a device detect "wrong wallet open" with a friendly
+    /// message instead of a late [`Error::ScriptMismatch`]. Never required;
+    /// never a security control — the prev_script re-derivation remains the
+    /// fund protector.
+    #[n(7)]
+    pub account_fp: Option<[u8; 4]>,
 }
 
 /// CBOR-encode a sign request.
@@ -154,6 +163,13 @@ pub struct ReviewSummary {
 /// Anything above this in a package is hostile or corrupt.
 pub const MAX_ATOMS: i64 = 21_000_000 * crate::amount::ATOMS_PER_DCR;
 
+/// Hard caps on package size. Far beyond anything a P2PKH send/receive wallet
+/// builds, but low enough that a hostile package cannot make a small device
+/// grind or allocate without bound.
+pub const MAX_INPUTS: usize = 1_000;
+/// See [`MAX_INPUTS`].
+pub const MAX_OUTPUTS: usize = 1_000;
+
 /// Sum amounts exactly in i128 (immune to i64 wrap-around from hostile
 /// values), then report i64::MAX on overflow — callers compare totals, and a
 /// saturated total can never masquerade as a valid balanced transaction once
@@ -179,6 +195,61 @@ impl SignRequest {
         max_index
             .saturating_add(OWNERSHIP_GAP)
             .min(OWNERSHIP_SCAN_MAX)
+    }
+
+    /// Structural + economic sanity, needing no key material. REFUSES packages
+    /// whose math cannot be honest: empty txs, oversized txs, out-of-range
+    /// amounts, duplicate inputs (which inflate the apparent input total and
+    /// understate the fee a reviewer sees), and outputs exceeding inputs
+    /// (negative fee). The network would reject all of these too, but a signer
+    /// must never even display them as if they were reviewable.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.inputs.is_empty() || self.outputs.is_empty() {
+            return Err(Error::InvalidRequest(
+                "transaction has no inputs or outputs",
+            ));
+        }
+        if self.inputs.len() > MAX_INPUTS || self.outputs.len() > MAX_OUTPUTS {
+            return Err(Error::InvalidRequest("too many inputs or outputs"));
+        }
+        for i in &self.inputs {
+            if i.value_in <= 0 {
+                return Err(Error::InvalidRequest("non-positive input amount"));
+            }
+            if i.value_in > MAX_ATOMS {
+                return Err(Error::InvalidRequest("input amount exceeds max supply"));
+            }
+        }
+        for o in &self.outputs {
+            if o.value < 0 {
+                return Err(Error::InvalidRequest("negative output amount"));
+            }
+            if o.value > MAX_ATOMS {
+                return Err(Error::InvalidRequest("output amount exceeds max supply"));
+            }
+        }
+        // Exact i128 sums: hostile i64 values cannot wrap the totals (and the
+        // per-amount caps above already bound each term).
+        let input_total: i128 = self.inputs.iter().map(|i| i.value_in as i128).sum();
+        let output_total: i128 = self.outputs.iter().map(|o| o.value as i128).sum();
+        if input_total > MAX_ATOMS as i128 {
+            return Err(Error::InvalidRequest("input total exceeds max supply"));
+        }
+        if input_total < output_total {
+            return Err(Error::InvalidRequest(
+                "outputs exceed inputs (negative fee)",
+            ));
+        }
+        // The same coin listed twice inflates the apparent input total and
+        // understates the fee shown for review. O(n²) is fine under MAX_INPUTS.
+        for (a, i) in self.inputs.iter().enumerate() {
+            for j in &self.inputs[a + 1..] {
+                if i.prev_hash == j.prev_hash && i.prev_index == j.prev_index && i.tree == j.tree {
+                    return Err(Error::InvalidRequest("same coin listed twice"));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Trustless review: instead of believing the companion's `is_change`
@@ -262,56 +333,32 @@ impl SignRequest {
 
     /// Verify (without touching the seed) that every input spends a key this
     /// wallet owns: the claimed `prev_script` must equal the P2PKH script of
-    /// the pubkey derived at `branch/index` below the account key. Also
-    /// enforces basic sanity: known branches, regular tree, positive amounts,
-    /// non-negative fee.
+    /// the pubkey derived at `branch/index` below the account key. Runs
+    /// [`SignRequest::validate`] first, then enforces known branches, the
+    /// regular tree, and non-hardened indices.
     pub fn check_owned_inputs(
         &self,
         secp: &Secp256k1<All>,
         account: &ExtPubKey,
     ) -> Result<(), Error> {
-        if self.inputs.is_empty() || self.outputs.is_empty() {
-            return Err(Error::InvalidRequest(
-                "transaction has no inputs or outputs",
-            ));
-        }
+        self.validate()?;
         for meta in &self.inputs {
             if meta.branch != BRANCH_EXTERNAL && meta.branch != BRANCH_INTERNAL {
                 return Err(Error::InvalidRequest("unknown derivation branch"));
+            }
+            if meta.index >= crate::hd::HARDENED {
+                return Err(Error::InvalidRequest("hardened address index"));
             }
             if meta.tree != 0 {
                 return Err(Error::InvalidRequest(
                     "only regular-tree outputs can be spent",
                 ));
             }
-            if meta.value_in <= 0 {
-                return Err(Error::InvalidRequest("non-positive input amount"));
-            }
-            if meta.value_in > MAX_ATOMS {
-                return Err(Error::InvalidRequest("input amount exceeds max supply"));
-            }
             let pubkey = account.pubkey_at(secp, meta.branch, meta.index)?;
             let expected = p2pkh_script(&hash160(&pubkey));
             if meta.prev_script != expected {
                 return Err(Error::ScriptMismatch);
             }
-        }
-        for o in &self.outputs {
-            if o.value < 0 {
-                return Err(Error::InvalidRequest("negative output amount"));
-            }
-            if o.value > MAX_ATOMS {
-                return Err(Error::InvalidRequest("output amount exceeds max supply"));
-            }
-        }
-        // Compare exact i128 sums: hostile i64 values cannot wrap the fee
-        // check even before the per-amount caps above are considered.
-        let input_total: i128 = self.inputs.iter().map(|i| i.value_in as i128).sum();
-        let output_total: i128 = self.outputs.iter().map(|o| o.value as i128).sum();
-        if input_total < output_total {
-            return Err(Error::InvalidRequest(
-                "outputs exceed inputs (negative fee)",
-            ));
         }
         Ok(())
     }
@@ -332,6 +379,9 @@ pub fn sign_request(
     master: &ExtPrivKey,
     req: &SignRequest,
 ) -> Result<Vec<u8>, Error> {
+    // The signer re-validates on its own: it must refuse dishonest math even
+    // if a caller skipped the review step.
+    req.validate()?;
     let account = master.account_key(secp, req.account)?;
 
     // Assemble the unsigned tx (sigScripts empty for sighash computation).

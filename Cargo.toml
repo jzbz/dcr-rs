@@ -7,7 +7,7 @@
 
 [package]
 name = "dcr-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Decred (DCR) primitives: BLAKE-256, addresses, HD keys, transaction wire format, and SigHashAll signing"
 license = "ISC"
