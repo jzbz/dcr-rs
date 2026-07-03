@@ -150,15 +150,28 @@ pub struct ReviewSummary {
     pub flagged_mismatches: Vec<(String, i64)>,
 }
 
+/// Largest legal Decred amount (dcrd `dcrutil.MaxAmount`): 21M DCR in atoms.
+/// Anything above this in a package is hostile or corrupt.
+pub const MAX_ATOMS: i64 = 21_000_000 * crate::amount::ATOMS_PER_DCR;
+
+/// Sum amounts exactly in i128 (immune to i64 wrap-around from hostile
+/// values), then report i64::MAX on overflow — callers compare totals, and a
+/// saturated total can never masquerade as a valid balanced transaction once
+/// per-amount MAX_ATOMS checks are in force.
+fn total_atoms<'a>(vals: impl Iterator<Item = &'a i64>) -> i64 {
+    let t: i128 = vals.map(|&v| v as i128).sum();
+    t.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
 impl SignRequest {
-    /// Sum of all input amounts, in atoms.
+    /// Sum of all input amounts, in atoms (saturating on hostile overflow).
     pub fn input_total(&self) -> i64 {
-        self.inputs.iter().map(|i| i.value_in).sum()
+        total_atoms(self.inputs.iter().map(|i| &i.value_in))
     }
 
-    /// Sum of all output amounts, in atoms.
+    /// Sum of all output amounts, in atoms (saturating on hostile overflow).
     pub fn output_total(&self) -> i64 {
-        self.outputs.iter().map(|o| o.value).sum()
+        total_atoms(self.outputs.iter().map(|o| &o.value))
     }
 
     fn scan_window(&self) -> u32 {
@@ -180,15 +193,37 @@ impl SignRequest {
         secp: &Secp256k1<All>,
         account: &ExtPubKey,
     ) -> Result<ReviewSummary, Error> {
-        // Precompute our own hash160s (external + change branches). The window
-        // tracks the wallet's usage level via the highest input index.
+        // Extract the P2PKH hash160 of every output up front (non-P2PKH can
+        // never be one of our keys), then scan our own keys (external + change
+        // branches; the window tracks the wallet's usage level via the highest
+        // input index) comparing against those few hashes as each key is
+        // derived. Memory stays O(outputs) instead of materializing the whole
+        // ownership set — up to ~40 KB at the scan cap, which matters on
+        // hardware wallets — and the scan stops early once every candidate
+        // output is already known to be ours.
+        let out_hashes: Vec<Option<[u8; 20]>> = self
+            .outputs
+            .iter()
+            .map(|o| p2pkh_hash160(&o.pk_script))
+            .collect();
+        let mut owned_out = alloc::vec![false; self.outputs.len()];
+        let mut unresolved = out_hashes.iter().filter(|h| h.is_some()).count();
+
         let window = self.scan_window();
-        let mut owned: Vec<[u8; 20]> = Vec::new();
-        for branch in [BRANCH_EXTERNAL, BRANCH_INTERNAL] {
+        'scan: for branch in [BRANCH_EXTERNAL, BRANCH_INTERNAL] {
             let branch_key = account.derive_child(secp, branch)?;
             for index in 0..=window {
+                if unresolved == 0 {
+                    break 'scan;
+                }
                 let key = branch_key.derive_child(secp, index)?;
-                owned.push(hash160(&key.compressed_pubkey()));
+                let h = hash160(&key.compressed_pubkey());
+                for (i, oh) in out_hashes.iter().enumerate() {
+                    if !owned_out[i] && *oh == Some(h) {
+                        owned_out[i] = true;
+                        unresolved -= 1;
+                    }
+                }
             }
         }
 
@@ -201,13 +236,9 @@ impl SignRequest {
         let mut recipients = Vec::new();
         let mut change = Vec::new();
         let mut flagged_mismatches = Vec::new();
-        for o in &self.outputs {
-            let owned_here = match p2pkh_hash160(&o.pk_script) {
-                Some(h) => owned.contains(&h),
-                None => false,
-            };
+        for (i, o) in self.outputs.iter().enumerate() {
             let addr = display(&o.pk_script);
-            if owned_here {
+            if owned_out[i] {
                 change.push((addr, o.value));
             } else {
                 recipients.push((addr.clone(), o.value));
@@ -256,6 +287,9 @@ impl SignRequest {
             if meta.value_in <= 0 {
                 return Err(Error::InvalidRequest("non-positive input amount"));
             }
+            if meta.value_in > MAX_ATOMS {
+                return Err(Error::InvalidRequest("input amount exceeds max supply"));
+            }
             let pubkey = account.pubkey_at(secp, meta.branch, meta.index)?;
             let expected = p2pkh_script(&hash160(&pubkey));
             if meta.prev_script != expected {
@@ -266,8 +300,15 @@ impl SignRequest {
             if o.value < 0 {
                 return Err(Error::InvalidRequest("negative output amount"));
             }
+            if o.value > MAX_ATOMS {
+                return Err(Error::InvalidRequest("output amount exceeds max supply"));
+            }
         }
-        if self.input_total() < self.output_total() {
+        // Compare exact i128 sums: hostile i64 values cannot wrap the fee
+        // check even before the per-amount caps above are considered.
+        let input_total: i128 = self.inputs.iter().map(|i| i.value_in as i128).sum();
+        let output_total: i128 = self.outputs.iter().map(|o| o.value as i128).sum();
+        if input_total < output_total {
             return Err(Error::InvalidRequest(
                 "outputs exceed inputs (negative fee)",
             ));
@@ -325,8 +366,21 @@ pub fn sign_request(
         expiry: req.expiry,
     };
 
-    // Sign each input.
+    // Sign each input. The structural checks duplicate check_owned_inputs on
+    // purpose: the signer must refuse out-of-schema derivation paths and
+    // stake-tree inputs on its own, even if a caller skipped the review step.
     for (idx, meta) in req.inputs.iter().enumerate() {
+        if meta.branch != BRANCH_EXTERNAL && meta.branch != BRANCH_INTERNAL {
+            return Err(Error::InvalidRequest("unknown derivation branch"));
+        }
+        if meta.index >= crate::hd::HARDENED {
+            return Err(Error::InvalidRequest("hardened address index"));
+        }
+        if meta.tree != 0 {
+            return Err(Error::InvalidRequest(
+                "only regular-tree outputs can be spent",
+            ));
+        }
         let key = account.address_key(secp, meta.branch, meta.index)?;
         let pubkey = key.compressed_pubkey(secp);
         let expected_script = p2pkh_script(&hash160(&pubkey));

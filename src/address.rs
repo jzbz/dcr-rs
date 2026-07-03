@@ -78,14 +78,21 @@ impl Address {
     /// the 2-byte version prefix.
     pub fn decode(s: &str) -> Result<Self, Error> {
         let (prefix, payload) = check_decode(s)?;
+        // Identify the prefix first so e.g. a P2PK address (33-byte payload)
+        // reports UnknownPrefix, not a length error.
+        let kind = if let Some(network) = Network::from_p2pkh_id(prefix) {
+            (network, AddressKind::P2pkh)
+        } else if let Some(network) = Network::from_p2sh_id(prefix) {
+            (network, AddressKind::P2sh)
+        } else {
+            return Err(Error::UnknownPrefix);
+        };
         let hash: [u8; 20] = payload.as_slice().try_into().map_err(|_| Error::Parse)?;
-        if let Some(network) = Network::from_p2pkh_id(prefix) {
-            return Ok(Address::p2pkh(hash, network));
-        }
-        if let Some(network) = Network::from_p2sh_id(prefix) {
-            return Ok(Address::p2sh(hash, network));
-        }
-        Err(Error::UnknownPrefix)
+        Ok(Address {
+            network: kind.0,
+            kind: kind.1,
+            hash,
+        })
     }
 
     /// The base58check address string.

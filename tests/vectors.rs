@@ -97,6 +97,16 @@ fn bip32_vector1_priv_and_pub_chains() {
 }
 
 #[test]
+fn bip32_seed_length_bounds() {
+    // dcrd hdkeychain: 16–64 bytes. Catching an entropy-for-seed mixup here
+    // beats deriving a wallet nothing else can reproduce.
+    assert!(ExtPrivKey::master_from_seed(&[0u8; 15], Network::Mainnet).is_err());
+    assert!(ExtPrivKey::master_from_seed(&[0u8; 65], Network::Mainnet).is_err());
+    assert!(ExtPrivKey::master_from_seed(&[7u8; 16], Network::Mainnet).is_ok());
+    assert!(ExtPrivKey::master_from_seed(&[7u8; 64], Network::Mainnet).is_ok());
+}
+
+#[test]
 fn bip32_serialization_roundtrip() {
     let secp = Secp256k1::new();
     let seed = hex::decode(BIP32_VEC1_SEED).unwrap();

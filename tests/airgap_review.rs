@@ -282,6 +282,90 @@ fn sign_request_is_self_consistent_and_low_s() {
 }
 
 #[test]
+fn check_owned_inputs_refuses_hostile_amounts() {
+    let secp = Secp256k1::new();
+    let m = master();
+    let account = account_pub(&secp, &m);
+    let key0 = m
+        .account_key(&secp, 0)
+        .unwrap()
+        .address_key(&secp, BRANCH_EXTERNAL, 0)
+        .unwrap();
+    let script0 = p2pkh_script(&hash160(&key0.compressed_pubkey(&secp))).to_vec();
+    let outputs = vec![OutputMeta {
+        value: 90_000,
+        version: 0,
+        pk_script: foreign_script(0xee),
+        is_change: false,
+    }];
+
+    // Single amount above max supply.
+    let mut bad = basic_request(script0.clone(), outputs.clone());
+    bad.inputs[0].value_in = dcr_rs::airgap::MAX_ATOMS + 1;
+    assert!(matches!(
+        bad.check_owned_inputs(&secp, &account),
+        Err(Error::InvalidRequest(_))
+    ));
+
+    // Two i64::MAX outputs wrap a naive i64 sum to negative, which would
+    // sneak past a wrapping fee check; the exact-sum comparison plus the
+    // per-amount cap must both refuse.
+    let mut bad = basic_request(script0, outputs);
+    bad.outputs = alloc_two_huge_outputs();
+    assert!(matches!(
+        bad.check_owned_inputs(&secp, &account),
+        Err(Error::InvalidRequest(_))
+    ));
+    // The public totals saturate rather than wrapping negative.
+    assert_eq!(bad.output_total(), i64::MAX);
+}
+
+fn alloc_two_huge_outputs() -> Vec<OutputMeta> {
+    let huge = |tag| OutputMeta {
+        value: i64::MAX,
+        version: 0,
+        pk_script: foreign_script(tag),
+        is_change: false,
+    };
+    vec![huge(0xaa), huge(0xbb)]
+}
+
+#[test]
+fn sign_request_refuses_out_of_schema_paths() {
+    let secp = Secp256k1::new();
+    let m = master();
+    let outputs = vec![OutputMeta {
+        value: 90_000,
+        version: 0,
+        pk_script: foreign_script(0xee),
+        is_change: false,
+    }];
+
+    // Even without check_owned_inputs, the signer itself must refuse
+    // non-wallet branches, hardened indices, and stake-tree inputs.
+    let mut req = basic_request(foreign_script(0x11), outputs.clone());
+    req.inputs[0].branch = 2;
+    assert!(matches!(
+        sign_request(&secp, &m, &req),
+        Err(Error::InvalidRequest(_))
+    ));
+
+    let mut req = basic_request(foreign_script(0x11), outputs.clone());
+    req.inputs[0].index = 0x8000_0000;
+    assert!(matches!(
+        sign_request(&secp, &m, &req),
+        Err(Error::InvalidRequest(_))
+    ));
+
+    let mut req = basic_request(foreign_script(0x11), outputs);
+    req.inputs[0].tree = 1;
+    assert!(matches!(
+        sign_request(&secp, &m, &req),
+        Err(Error::InvalidRequest(_))
+    ));
+}
+
+#[test]
 fn sign_request_refuses_prev_script_mismatch() {
     let secp = Secp256k1::new();
     let m = master();

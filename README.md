@@ -8,7 +8,7 @@ and low-S ECDSA P2PKH signing. `no_std + alloc` friendly — the same crate runs
 on a host wallet and on embedded signers.
 
 Grown out of the Decred signing cores written for the
-[Keystone 3](https://github.com/KeystoneHQ/keystone3-firmware) and KeyOS
+[KeyOS](https://github.com/Foundation-Devices/KeyOS) and [Keystone 3](https://github.com/KeystoneHQ/keystone3-firmware)
 hardware-wallet firmwares, generalized to all four dcrd networks and both
 private (signer) and public (watch-only) derivation.
 
@@ -136,14 +136,20 @@ cargo test --all-features
 
 ## Security notes
 
-- Private key material (`ExtPrivKey` secrets and chain codes, including every
-  intermediate along a derivation path) is zeroized on drop.
+- Private key material is zeroized on drop: `ExtPrivKey` secrets and chain
+  codes (including every intermediate along a derivation path), BIP32 HMAC
+  outputs, BIP39 mnemonics and seeds, and the buffers used to serialize and
+  parse `dprv` strings.
 - `ExtPrivKey` deliberately implements neither `Debug` nor `Display`.
 - Signatures are RFC6979-deterministic and low-S normalized.
+- Seeds are bounds-checked (16–64 bytes, per BIP32/dcrd), airgap amounts are
+  capped at max supply with exact (non-wrapping) fee arithmetic, and the tx
+  parser rejects hostile counts/lengths before allocating.
 - The airgap signer re-derives each input's key and refuses to sign when the
-  claimed prevout script does not match (`Error::ScriptMismatch`), and the
-  review logic re-derives change ownership rather than trusting the
-  companion's `is_change` flags.
+  claimed prevout script does not match (`Error::ScriptMismatch`), refuses
+  out-of-schema derivation paths and stake-tree inputs on its own (even if the
+  caller skipped review), and the review logic re-derives change ownership
+  rather than trusting the companion's `is_change` flags.
 - `#![forbid(unsafe_code)]`.
 
 This library has **not** been independently audited. Use at your own risk.
