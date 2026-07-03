@@ -386,7 +386,8 @@ mod fp_compat {
         assert_eq!(req.account, 0);
         assert_eq!(req.inputs.len(), 1);
         assert_eq!(req.outputs.len(), 1);
-        req.validate().expect("legacy fixture is economically valid");
+        req.validate()
+            .expect("legacy fixture is economically valid");
     }
 
     #[test]
