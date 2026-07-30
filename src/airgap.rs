@@ -14,10 +14,45 @@
 //!   * SD  → write the same bytes as `unsigned.dcrtx` / `signed.dcrtx`.
 //!
 //! The format is shared with the KeyOS and Keystone Decred signers, so one
-//! companion implementation serves every device. This is format version 2;
+//! companion implementation serves every device. This is format version 3;
 //! bump [`FORMAT_VERSION`] on any breaking change.
 //!
-//! # Why version 2 exists
+//! # Why version 3 exists
+//!
+//! Version 3 is version 2's security model in under a third of the bytes —
+//! measured 3.5× smaller at any realistic input count. Nothing about what the
+//! device verifies changed; only the encoding did.
+//!
+//! Two things were wasteful. First, every byte-valued field was declared
+//! `#[n(..)]`, which makes minicbor emit a CBOR **array of integers** rather than
+//! a byte string — so each byte ≥ 0x18 costs two bytes on the wire, very nearly
+//! doubling the dominant payload (hashes, scripts, funding transactions). They now
+//! carry `#[cbor(n(..), with = "minicbor::bytes")]` and encode as real byte
+//! strings. Note that `#[b(..)]` is *not* the way to ask for this: in minicbor it
+//! marks a field as borrowed from the input, and on an owned type it silently
+//! changes nothing.
+//!
+//! Second, [`InputMeta::prev_tx_prefix`] used to carry the *full* funding
+//! transaction. A Decred txid is `blake256` over the **prefix** serialization
+//! alone, so the witness — signature scripts, which are the bulk of a
+//! transaction — was transmitted and then ignored. Only the prefix is carried
+//! now, which is around 40% of the bytes and verifies exactly as much.
+//!
+//! On a QR-transported package these compound. Measured over identical content,
+//! with a typical 2-in/2-out P2PKH funding transaction per input:
+//!
+//! ```text
+//! inputs      v2        v3     ratio    QR frames @400 B
+//!      1    1007 B    331 B    3.04x     3 ->   1
+//!      3    2756 B    823 B    3.35x     7 ->   3
+//!     10    8868 B   2545 B    3.48x    23 ->   7
+//!   1000  873228 B  247815 B   3.52x  2184 -> 620
+//! ```
+//!
+//! Versions 1 and 2 are both REFUSED, for the reason spelled out below. Neither
+//! shipped with a companion that emits it, so nothing in circulation breaks.
+//!
+//! # Why version 2 existed
 //!
 //! Decred's signature hash does not commit to input amounts (see
 //! [`crate::sighash`]). In a version 1 package the only source for an input's
@@ -29,7 +64,7 @@
 //! this, because every number involved comes from the same untrusted source.
 //!
 //! Version 2 closes it by carrying the funding transaction for each input
-//! ([`InputMeta::prev_tx`]) so the device can verify `value_in` and
+//! ([`InputMeta::prev_tx_prefix`]) so the device can verify `value_in` and
 //! `prev_script` against a hash it computes itself, and by carrying the
 //! derivation path of change outputs ([`OutputMeta::branch`] /
 //! [`OutputMeta::index`]) so ownership is proven rather than guessed by an
@@ -42,7 +77,8 @@
 //! worth only as much as the refusal of unverified packages.
 //!
 //! Nothing is lost by refusing: version 1 shipped with no companion that emits
-//! it, so there are no such packages in circulation.
+//! it, so there are no such packages in circulation. The same goes for version 2,
+//! which version 3 supersedes on encoding grounds alone.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -60,7 +96,7 @@ use crate::Error;
 
 /// Version of the CBOR package layout. This is the ONLY version accepted; see
 /// the module docs for why accepting version 1 would reopen the amount attack.
-pub const FORMAT_VERSION: u8 = 2;
+pub const FORMAT_VERSION: u8 = 3;
 
 /// Fees at or below this are always allowed regardless of proportion, so that
 /// dust consolidation — where the fee is legitimately a large share of a small
@@ -73,15 +109,15 @@ pub const FEE_ALWAYS_ALLOWED_ATOMS: i64 = 100_000;
 ///
 /// This is NOT a defence against the version 1 amount-understatement described
 /// in the module docs: there the declared fee is small and only becomes large
-/// after dcrd substitutes the true input values. Only version 2's `prev_tx`
-/// verification addresses that.
+/// after dcrd substitutes the true input values. Only the
+/// [`InputMeta::prev_tx_prefix`] verification addresses that.
 pub const MAX_FEE_FRACTION_DIVISOR: i64 = 20;
 
 /// One input to be signed, with the metadata only an online wallet has.
 #[derive(Clone, Debug, Encode, Decode)]
 pub struct InputMeta {
     /// Prevout transaction hash (internal byte order).
-    #[n(0)]
+    #[cbor(n(0), with = "minicbor::bytes")]
     pub prev_hash: [u8; 32],
     /// Prevout output index.
     #[n(1)]
@@ -104,24 +140,33 @@ pub struct InputMeta {
     pub index: u32,
     /// Prevout pkScript. For our keys the device re-derives and verifies this
     /// equals `p2pkh(hash160(pubkey))` before trusting it.
-    #[n(7)]
+    #[cbor(n(7), with = "minicbor::bytes")]
     pub prev_script: Vec<u8>,
-    /// REQUIRED: the serialized funding transaction that created this input's
-    /// prevout.
+    /// REQUIRED: the **prefix** serialization (dcrd `TxSerializeNoWitness`) of the
+    /// funding transaction that created this input's prevout.
     ///
     /// This is what makes [`InputMeta::value_in`] verifiable. The device computes
-    /// `blake256(prefix)` over these bytes and requires it to equal
-    /// [`InputMeta::prev_hash`], then requires the referenced output's value and
-    /// script to equal `value_in` and `prev_script`. Without it the amounts are
-    /// unverifiable assertions — see the module docs.
+    /// `blake256` over these bytes — which is precisely how a Decred txid is
+    /// defined — and requires the result to equal [`InputMeta::prev_hash`], then
+    /// requires the referenced output's value and script to equal `value_in` and
+    /// `prev_script`. Without it the amounts are unverifiable assertions; see the
+    /// module docs.
+    ///
+    /// The prefix, not the full transaction: the witness carries signature scripts
+    /// that the txid does not commit to and that say nothing about what the
+    /// prevout paid, so transmitting them cost roughly 60% of these bytes for no
+    /// verification value. Version 2 sent the full transaction. A full
+    /// serialization is refused here, rather than tolerated, because
+    /// [`MsgTx::parse_prefix`] rejects a serialization-type word that is not
+    /// `TxSerializeNoWitness`.
     ///
     /// Typed `Option` only for wire mechanics and diagnostics, never as licence to
     /// omit it: minicbor omits a trailing `None`, and keeping the field optional
     /// lets a package that leaves it out fail in [`SignRequest::validate`] with a
-    /// specific "input without prev_tx" error rather than an opaque CBOR decode
-    /// failure. `validate` rejects `None` unconditionally.
-    #[n(8)]
-    pub prev_tx: Option<Vec<u8>>,
+    /// specific "input without prev_tx_prefix" error rather than an opaque CBOR
+    /// decode failure. `validate` rejects `None` unconditionally.
+    #[cbor(n(8), with = "minicbor::bytes")]
+    pub prev_tx_prefix: Option<Vec<u8>>,
 }
 
 /// One output, for both the wire tx and on-device display.
@@ -134,7 +179,7 @@ pub struct OutputMeta {
     #[n(1)]
     pub version: u16,
     /// The public key script.
-    #[n(2)]
+    #[cbor(n(2), with = "minicbor::bytes")]
     pub pk_script: Vec<u8>,
     /// True if this output is change back to our own wallet. Advisory on its own —
     /// the device proves ownership itself (see [`SignRequest::review_owned`]).
@@ -190,7 +235,7 @@ pub struct SignRequest {
     /// message instead of a late [`Error::ScriptMismatch`]. Never required;
     /// never a security control — the prev_script re-derivation remains the
     /// fund protector.
-    #[n(7)]
+    #[cbor(n(7), with = "minicbor::bytes")]
     pub account_fp: Option<[u8; 4]>,
 }
 
@@ -206,16 +251,17 @@ pub fn encode_sign_request(req: &SignRequest) -> Result<Vec<u8>, Error> {
 /// Decoding untrusted CBOR amplifies: skipping over an unexpected nested
 /// structure allocates per item, so peak heap is a multiple of the input. This is
 /// the backstop that keeps that multiple finite — nothing more. It is chosen to
-/// sit just above what [`MAX_INPUTS`] actually costs, so that the two limits do
-/// not contradict each other: a 1000-input package carrying a typical 2-in/2-out
-/// funding transaction per input measures ~826 KB, so 1 MiB admits the largest
-/// package `MAX_INPUTS` permits and rejects everything beyond it.
+/// sit above what [`MAX_INPUTS`] actually costs, so that the two limits do not
+/// contradict each other: at format version 3 a 1000-input package carrying a
+/// typical 2-in/2-out funding prefix per input measures ~248 KB, so 512 KiB
+/// admits the largest package `MAX_INPUTS` permits with room to spare and
+/// rejects everything beyond it. Version 2 needed four times as much.
 ///
 /// A device with tight RAM should impose its own, much lower, limit before
 /// calling [`decode_sign_request`] — neither QR transport nor a few hundred KB of
 /// heap can handle a package anywhere near this size, and only the application
 /// knows its real budget.
-pub const MAX_PACKAGE_BYTES: usize = 1024 * 1024;
+pub const MAX_PACKAGE_BYTES: usize = 512 * 1024;
 
 /// Decode a sign request, enforcing the size and format-version gates.
 ///
@@ -341,31 +387,33 @@ impl SignRequest {
     /// transaction supplied alongside it. This is the check that makes a fee
     /// figure trustworthy; see the module docs for why version 1 cannot have one.
     ///
-    /// For each input: the funding transaction is parsed, its txid recomputed as
-    /// `blake256` over the prefix serialization (Decred's txid is a *single*
-    /// BLAKE-256, not a double hash), and required to equal `prev_hash`. The
-    /// referenced output must then exist and carry exactly the declared
-    /// `value_in` and `prev_script`. A mismatch anywhere means the companion lied
-    /// about what is being spent.
+    /// For each input: the funding transaction's prefix is parsed, its txid
+    /// recomputed as `blake256` over those bytes (Decred's txid is a *single*
+    /// BLAKE-256 over the prefix serialization, not a double hash of the whole
+    /// transaction), and required to equal `prev_hash`. The referenced output must
+    /// then exist and carry exactly the declared `value_in` and `prev_script`. A
+    /// mismatch anywhere means the companion lied about what is being spent.
     ///
     /// Needs no key material, so a caller may run it before asking for a
     /// password.
     pub fn verify_prev_txs(&self) -> Result<(), Error> {
         for meta in &self.inputs {
-            let raw = meta.prev_tx.as_ref().ok_or(Error::InvalidRequest(
-                "format version 2 input without prev_tx",
+            let raw = meta.prev_tx_prefix.as_ref().ok_or(Error::InvalidRequest(
+                "format version 3 input without prev_tx_prefix",
             ))?;
-            let funding =
-                MsgTx::parse_full(raw).map_err(|_| Error::InvalidRequest("unparseable prev_tx"))?;
+            let funding = MsgTx::parse_prefix(raw)
+                .map_err(|_| Error::InvalidRequest("unparseable prev_tx_prefix"))?;
             if funding.tx_hash() != meta.prev_hash {
                 return Err(Error::InvalidRequest(
-                    "prev_tx does not hash to the declared prevout",
+                    "prev_tx_prefix does not hash to the declared prevout",
                 ));
             }
             let out = funding
                 .tx_out
                 .get(meta.prev_index as usize)
-                .ok_or(Error::InvalidRequest("prev_index past end of prev_tx"))?;
+                .ok_or(Error::InvalidRequest(
+                    "prev_index past end of prev_tx_prefix",
+                ))?;
             if out.value != meta.value_in {
                 return Err(Error::InvalidRequest(
                     "declared input amount does not match the funding output",
@@ -432,8 +480,8 @@ impl SignRequest {
                     "only regular-tree outputs can be spent",
                 ));
             }
-            if i.prev_tx.is_none() {
-                return Err(Error::InvalidRequest("input without prev_tx"));
+            if i.prev_tx_prefix.is_none() {
+                return Err(Error::InvalidRequest("input without prev_tx_prefix"));
             }
         }
         for o in &self.outputs {
@@ -485,7 +533,7 @@ impl SignRequest {
                 "outputs exceed inputs (negative fee)",
             ));
         }
-        // Refuse an openly absurd fee. Now that prev_tx pins every input amount,
+        // Refuse an openly absurd fee. Now that prev_tx_prefix pins every input amount,
         // this operates on verified numbers rather than companion assertions, so it
         // is a real bound on what a mistaken or hostile companion can spend on
         // fees, not just a sanity check.

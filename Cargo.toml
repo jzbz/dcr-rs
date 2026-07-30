@@ -7,7 +7,7 @@
 
 [package]
 name = "dcr-rs"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 # Set by the dependency floor, not by this crate's own source: zeroize 1.9 and
 # zeroize_derive 1.5 declare 1.85. Embedded targets often sit on a pinned
@@ -51,8 +51,10 @@ bs58 = { version = "0.5", default-features = false, features = ["alloc"] }
 # decoder's intermediates sit) untouched. The Vec impl clears the full capacity.
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 bip39 = { version = "2.1", default-features = false, features = ["alloc", "zeroize"], optional = true }
-# Pinned to the 0.24 line: the KeyOS/Keystone airgap format (FORMAT_VERSION 1)
-# was written against it, so the derived CBOR layout stays byte-identical.
+# Pinned to the 0.24 line: the airgap format's derived CBOR layout must stay
+# byte-identical, and the derive macro's attribute semantics are part of that.
+# Note `#[b(n)]` means *borrowed*, not bytes — byte-string fields need
+# `#[cbor(n(n), with = "minicbor::bytes")]`, which is what FORMAT_VERSION 3 uses.
 minicbor = { version = "0.24", default-features = false, features = ["alloc", "derive"], optional = true }
 
 [dev-dependencies]
