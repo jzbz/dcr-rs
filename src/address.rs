@@ -61,8 +61,13 @@ impl Address {
         }
     }
 
-    /// P2PKH address for a serialized (compressed, 33-byte) public key.
-    pub fn from_pubkey(pubkey: &[u8], network: Network) -> Self {
+    /// P2PKH address for a compressed public key.
+    ///
+    /// Takes a fixed 33-byte array rather than a slice on purpose: Decred
+    /// commits to the *compressed* pubkey, so hashing an uncompressed (65-byte)
+    /// or truncated key would mint a well-formed address that nothing can ever
+    /// spend, with no error to notice.
+    pub fn from_pubkey(pubkey: &[u8; 33], network: Network) -> Self {
         Address::p2pkh(hash160(pubkey), network)
     }
 
@@ -93,6 +98,22 @@ impl Address {
             kind: kind.1,
             hash,
         })
+    }
+
+    /// [`Self::decode`], additionally requiring the address to belong to
+    /// `network`.
+    ///
+    /// Prefer this wherever a network is already known. [`Self::decode`] reports
+    /// whichever network the prefix names, and [`Self::pk_script`] is
+    /// network-blind — it pays the 20-byte hash regardless — so decoding a
+    /// pasted testnet address on mainnet and paying it produces a perfectly
+    /// valid mainnet payment to an address the user never meant to use.
+    pub fn decode_for(s: &str, network: Network) -> Result<Self, Error> {
+        let addr = Address::decode(s)?;
+        if addr.network != network {
+            return Err(Error::UnknownPrefix);
+        }
+        Ok(addr)
     }
 
     /// The base58check address string.

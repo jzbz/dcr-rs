@@ -67,6 +67,26 @@ impl Default for Blake256 {
     }
 }
 
+/// Wipe the hasher state on drop.
+///
+/// `update` copies message bytes into `buf`, so hashing secret material — which
+/// this crate does, e.g. the buffer holding a raw scalar in
+/// `hd::serialize_ext_key` — would otherwise leave up to 64 bytes of it behind
+/// in freed memory, quietly undercutting the explicit `zeroize` calls in
+/// [`crate::hd`]. This covers the hasher's own state; the round function's
+/// locals live in registers/stack that Rust gives no way to scrub.
+impl Drop for Blake256 {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        // `buf` holds raw message bytes and `h` the chaining state. `buf_len` and
+        // `compressed_bits` are lengths, not secrets, and each extra `zeroize`
+        // emits its own compiler fence — measurably so on short inputs, which is
+        // most of what this crate hashes — so they are left alone.
+        self.buf.zeroize();
+        self.h.zeroize();
+    }
+}
+
 impl Blake256 {
     /// Fresh hasher state.
     pub fn new() -> Self {

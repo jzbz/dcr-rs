@@ -21,10 +21,20 @@ pub const SER_NO_WITNESS: u16 = 1;
 /// Serialization type word for the witness alone.
 pub const SER_ONLY_WITNESS: u16 = 2;
 
-/// Sentinel for "unknown" witness block height (matches dcrd null values).
-pub const NULL_BLOCK_HEIGHT: u32 = 0xffff_ffff;
-/// Sentinel for "unknown" witness block index (matches dcrd null values).
+/// Sentinel for "unknown" witness block height (dcrd `wire.NullBlockHeight`,
+/// which references the genesis block and so is **zero**, not all-ones).
+pub const NULL_BLOCK_HEIGHT: u32 = 0x0000_0000;
+/// Sentinel for "unknown" witness block index (dcrd `wire.NullBlockIndex`).
 pub const NULL_BLOCK_INDEX: u32 = 0xffff_ffff;
+/// Sentinel for "unknown" witness input value (dcrd `wire.NullValueIn`).
+pub const NULL_VALUE_IN: i64 = -1;
+
+/// Cap on the element count a parser pre-allocates for. `read_count` already
+/// bounds a hostile count by the bytes left in the buffer, but the per-element
+/// struct is wider than its minimum wire size (a `TxOut` is ~40 bytes for an
+/// 11-byte minimum), so a large buffer would still amplify. Beyond this the
+/// `Vec` simply grows as items are actually read.
+const PREALLOC_LIMIT: usize = 1024;
 
 /// Reference to a previous transaction output.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +108,24 @@ pub fn put_varint(out: &mut Vec<u8>, val: u64) {
     }
 }
 
+/// Number of bytes [`put_varint`] writes for `val`.
+pub const fn varint_size(val: u64) -> usize {
+    if val < 0xfd {
+        1
+    } else if val <= 0xffff {
+        3
+    } else if val <= 0xffff_ffff {
+        5
+    } else {
+        9
+    }
+}
+
+/// Read a compact-size varint, rejecting non-canonical encodings exactly as
+/// dcrd's `wire.ReadVarInt` does (`ErrNonCanonicalVarInt`): a value must use
+/// the shortest form that can hold it. Without this check two distinct byte
+/// strings decode to the same transaction, so `parse_full` would not be the
+/// inverse of `serialize_full` and a signer would accept bytes dcrd refuses.
 fn read_varint(buf: &[u8], pos: &mut usize) -> Result<u64, Error> {
     let first = *buf.get(*pos).ok_or(Error::Parse)?;
     *pos += 1;
@@ -105,17 +133,29 @@ fn read_varint(buf: &[u8], pos: &mut usize) -> Result<u64, Error> {
         0xff => {
             let b = buf.get(*pos..*pos + 8).ok_or(Error::Parse)?;
             *pos += 8;
-            u64::from_le_bytes(b.try_into().unwrap())
+            let v = u64::from_le_bytes(b.try_into().unwrap());
+            if v <= 0xffff_ffff {
+                return Err(Error::Parse);
+            }
+            v
         }
         0xfe => {
             let b = buf.get(*pos..*pos + 4).ok_or(Error::Parse)?;
             *pos += 4;
-            u32::from_le_bytes(b.try_into().unwrap()) as u64
+            let v = u32::from_le_bytes(b.try_into().unwrap()) as u64;
+            if v <= 0xffff {
+                return Err(Error::Parse);
+            }
+            v
         }
         0xfd => {
             let b = buf.get(*pos..*pos + 2).ok_or(Error::Parse)?;
             *pos += 2;
-            u16::from_le_bytes(b.try_into().unwrap()) as u64
+            let v = u16::from_le_bytes(b.try_into().unwrap()) as u64;
+            if v < 0xfd {
+                return Err(Error::Parse);
+            }
+            v
         }
         n => n as u64,
     };
@@ -173,6 +213,36 @@ impl MsgTx {
         (self.version as u32) | ((ser_type as u32) << 16)
     }
 
+    /// Exact byte length of [`Self::write_prefix_body`], so the serializers and
+    /// the sighash can size their buffers once instead of growing by doubling.
+    pub(crate) fn prefix_body_size(&self) -> usize {
+        varint_size(self.tx_in.len() as u64)
+            + self.tx_in.len() * 41
+            + varint_size(self.tx_out.len() as u64)
+            + self
+                .tx_out
+                .iter()
+                .map(|o| 8 + 2 + varint_size(o.pk_script.len() as u64) + o.pk_script.len())
+                .sum::<usize>()
+            + 4
+            + 4
+    }
+
+    /// Exact byte length of [`Self::write_witness_body`].
+    fn witness_body_size(&self) -> usize {
+        varint_size(self.tx_in.len() as u64)
+            + self
+                .tx_in
+                .iter()
+                .map(|i| {
+                    8 + 4
+                        + 4
+                        + varint_size(i.signature_script.len() as u64)
+                        + i.signature_script.len()
+                })
+                .sum::<usize>()
+    }
+
     fn write_prefix_body(&self, o: &mut Vec<u8>) {
         put_varint(o, self.tx_in.len() as u64);
         for ti in &self.tx_in {
@@ -205,7 +275,7 @@ impl MsgTx {
 
     /// Prefix serialization (TxSerializeNoWitness).
     pub fn serialize_prefix(&self) -> Vec<u8> {
-        let mut o = Vec::new();
+        let mut o = Vec::with_capacity(4 + self.prefix_body_size());
         o.extend_from_slice(&self.ser_version(SER_NO_WITNESS).to_le_bytes());
         self.write_prefix_body(&mut o);
         o
@@ -214,7 +284,7 @@ impl MsgTx {
     /// Witness serialization (TxSerializeOnlyWitness) — the real broadcast
     /// witness (valueIn/height/index/sigScript), NOT the sighash witness.
     pub fn serialize_witness(&self) -> Vec<u8> {
-        let mut o = Vec::new();
+        let mut o = Vec::with_capacity(4 + self.witness_body_size());
         o.extend_from_slice(&self.ser_version(SER_ONLY_WITNESS).to_le_bytes());
         self.write_witness_body(&mut o);
         o
@@ -222,7 +292,7 @@ impl MsgTx {
 
     /// Full serialization (prefix ‖ witness) — the bytes a wallet broadcasts.
     pub fn serialize_full(&self) -> Vec<u8> {
-        let mut o = Vec::new();
+        let mut o = Vec::with_capacity(4 + self.prefix_body_size() + self.witness_body_size());
         o.extend_from_slice(&self.ser_version(SER_FULL).to_le_bytes());
         self.write_prefix_body(&mut o);
         self.write_witness_body(&mut o);
@@ -247,7 +317,7 @@ impl MsgTx {
 
         // Minimum sizes: prefix input 41 B, output 11 B, witness input 17 B.
         let n_in = read_count(buf, &mut pos, 41)?;
-        let mut inputs: Vec<(OutPoint, u32)> = Vec::with_capacity(n_in);
+        let mut inputs: Vec<(OutPoint, u32)> = Vec::with_capacity(n_in.min(PREALLOC_LIMIT));
         for _ in 0..n_in {
             let mut hash = [0u8; 32];
             hash.copy_from_slice(read_bytes(buf, &mut pos, 32)?);
@@ -258,7 +328,7 @@ impl MsgTx {
         }
 
         let n_out = read_count(buf, &mut pos, 11)?;
-        let mut tx_out = Vec::with_capacity(n_out);
+        let mut tx_out = Vec::with_capacity(n_out.min(PREALLOC_LIMIT));
         for _ in 0..n_out {
             let value = read_i64(buf, &mut pos)?;
             let version = read_u16(buf, &mut pos)?;
@@ -278,7 +348,7 @@ impl MsgTx {
         if n_wit != n_in {
             return Err(Error::Parse);
         }
-        let mut tx_in = Vec::with_capacity(n_in);
+        let mut tx_in = Vec::with_capacity(n_in.min(PREALLOC_LIMIT));
         for (outpoint, sequence) in inputs {
             let value_in = read_i64(buf, &mut pos)?;
             let block_height = read_u32(buf, &mut pos)?;
@@ -292,6 +362,77 @@ impl MsgTx {
                 block_index,
                 signature_script,
             });
+        }
+
+        // Reject trailing bytes. A signer must not accept a buffer that carries
+        // anything beyond the transaction it thinks it parsed: padding after a
+        // complete tx is invisible to `serialize_full`, so accepting it would
+        // make `parse_full` non-injective the same way a non-canonical varint
+        // does.
+        if pos != buf.len() {
+            return Err(Error::Parse);
+        }
+
+        Ok(MsgTx {
+            version,
+            tx_in,
+            tx_out,
+            lock_time,
+            expiry,
+        })
+    }
+
+    /// Parse a prefix-only (TxSerializeNoWitness) Decred transaction. The
+    /// witness fields of every input are set to the dcrd null sentinels and the
+    /// signature scripts are empty, because prefix bytes do not carry them.
+    ///
+    /// This is enough to recompute a txid — [`Self::tx_hash`] hashes only the
+    /// prefix — so a caller verifying what a prevout paid needs nothing more.
+    pub fn parse_prefix(buf: &[u8]) -> Result<MsgTx, Error> {
+        let mut pos = 0usize;
+        let ver_word = read_u32(buf, &mut pos)?;
+        let version = (ver_word & 0xffff) as u16;
+        let ser_type = ((ver_word >> 16) & 0xffff) as u16;
+        if ser_type != SER_NO_WITNESS {
+            return Err(Error::Parse);
+        }
+
+        let n_in = read_count(buf, &mut pos, 41)?;
+        let mut tx_in = Vec::with_capacity(n_in.min(PREALLOC_LIMIT));
+        for _ in 0..n_in {
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(read_bytes(buf, &mut pos, 32)?);
+            let index = read_u32(buf, &mut pos)?;
+            let tree = *read_bytes(buf, &mut pos, 1)?.first().unwrap();
+            let sequence = read_u32(buf, &mut pos)?;
+            tx_in.push(TxIn {
+                previous_outpoint: OutPoint { hash, index, tree },
+                sequence,
+                value_in: NULL_VALUE_IN,
+                block_height: NULL_BLOCK_HEIGHT,
+                block_index: NULL_BLOCK_INDEX,
+                signature_script: Vec::new(),
+            });
+        }
+
+        let n_out = read_count(buf, &mut pos, 11)?;
+        let mut tx_out = Vec::with_capacity(n_out.min(PREALLOC_LIMIT));
+        for _ in 0..n_out {
+            let value = read_i64(buf, &mut pos)?;
+            let version = read_u16(buf, &mut pos)?;
+            let pk_script = read_var_bytes(buf, &mut pos)?.to_vec();
+            tx_out.push(TxOut {
+                value,
+                version,
+                pk_script,
+            });
+        }
+
+        let lock_time = read_u32(buf, &mut pos)?;
+        let expiry = read_u32(buf, &mut pos)?;
+
+        if pos != buf.len() {
+            return Err(Error::Parse);
         }
 
         Ok(MsgTx {

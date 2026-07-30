@@ -9,6 +9,11 @@
 name = "dcr-rs"
 version = "0.3.0"
 edition = "2021"
+# Set by the dependency floor, not by this crate's own source: zeroize 1.9 and
+# zeroize_derive 1.5 declare 1.85. Embedded targets often sit on a pinned
+# toolchain, so state it rather than letting the failure surface from inside a
+# dependency. Lowering it means capping `zeroize` at 1.8.
+rust-version = "1.85"
 description = "Decred (DCR) primitives: BLAKE-256, addresses, HD keys, transaction wire format, and SigHashAll signing"
 license = "ISC"
 repository = "https://github.com/jzbz/dcr-rs"
@@ -40,7 +45,11 @@ sha2 = { version = "0.10", default-features = false }
 hmac = { version = "0.12", default-features = false }
 ripemd = { version = "0.1", default-features = false }
 bs58 = { version = "0.5", default-features = false, features = ["alloc"] }
-zeroize = { version = "1", default-features = false }
+# `alloc` is a DEFAULT feature of zeroize that carries `impl Zeroize for Vec<T>`.
+# Without it `vec.zeroize()` silently resolves to the `[T]` impl via deref, which
+# wipes only the current contents and leaves spare capacity (where a base58
+# decoder's intermediates sit) untouched. The Vec impl clears the full capacity.
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 bip39 = { version = "2.1", default-features = false, features = ["alloc", "zeroize"], optional = true }
 # Pinned to the 0.24 line: the KeyOS/Keystone airgap format (FORMAT_VERSION 1)
 # was written against it, so the derived CBOR layout stays byte-identical.

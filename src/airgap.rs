@@ -53,7 +53,8 @@ use secp256k1::{All, Secp256k1};
 use crate::address::{p2pkh_script, Address};
 use crate::hashing::hash160;
 use crate::hd::{ExtPrivKey, ExtPubKey, BRANCH_EXTERNAL, BRANCH_INTERNAL};
-use crate::sign::sign_p2pkh_input;
+use crate::sighash::prefix_hash_all;
+use crate::sign::sign_p2pkh_input_cached;
 use crate::tx::{MsgTx, OutPoint, TxIn, TxOut, NULL_BLOCK_HEIGHT, NULL_BLOCK_INDEX};
 use crate::Error;
 
@@ -200,12 +201,31 @@ pub fn encode_sign_request(req: &SignRequest) -> Result<Vec<u8>, Error> {
     Ok(buf)
 }
 
-/// Decode a sign request, enforcing the format version gate.
+/// Largest CBOR package accepted by [`decode_sign_request`].
+///
+/// Decoding untrusted CBOR amplifies: skipping over an unexpected nested
+/// structure allocates per item, so peak heap is a multiple of the input. This is
+/// the backstop that keeps that multiple finite — nothing more. It is chosen to
+/// sit just above what [`MAX_INPUTS`] actually costs, so that the two limits do
+/// not contradict each other: a 1000-input package carrying a typical 2-in/2-out
+/// funding transaction per input measures ~826 KB, so 1 MiB admits the largest
+/// package `MAX_INPUTS` permits and rejects everything beyond it.
+///
+/// A device with tight RAM should impose its own, much lower, limit before
+/// calling [`decode_sign_request`] — neither QR transport nor a few hundred KB of
+/// heap can handle a package anywhere near this size, and only the application
+/// knows its real budget.
+pub const MAX_PACKAGE_BYTES: usize = 1024 * 1024;
+
+/// Decode a sign request, enforcing the size and format-version gates.
 ///
 /// Only [`FORMAT_VERSION`] is accepted. Version 1 packages are refused here
 /// rather than downgraded to an unverified path, because the sender picks the
 /// version and would otherwise choose the weaker one.
 pub fn decode_sign_request(bytes: &[u8]) -> Result<SignRequest, Error> {
+    if bytes.len() > MAX_PACKAGE_BYTES {
+        return Err(Error::InvalidRequest("package too large"));
+    }
     let req: SignRequest = minicbor::decode(bytes).map_err(|_| Error::Parse)?;
     if req.format_version != FORMAT_VERSION {
         return Err(Error::UnsupportedVersion);
@@ -214,6 +234,10 @@ pub fn decode_sign_request(bytes: &[u8]) -> Result<SignRequest, Error> {
 }
 
 /// A human-reviewable summary the UI shows before the user approves signing.
+///
+/// Holds nothing secret — addresses and amounts that are about to go on a screen
+/// anyway — so it is `Debug`.
+#[derive(Clone, Debug)]
 pub struct ReviewSummary {
     /// (address, amount) for every output the device does NOT own.
     pub recipients: Vec<(String, i64)>,
@@ -253,6 +277,53 @@ pub const MAX_OUTPUTS: usize = 1_000;
 fn total_atoms<'a>(vals: impl Iterator<Item = &'a i64>) -> i64 {
     let t: i128 = vals.map(|&v| v as i128).sum();
     t.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+/// Slot in a branch-key cache. `validate` already restricts branches to these
+/// two, so a request can never widen the cache.
+fn branch_slot(branch: u32) -> Result<usize, Error> {
+    match branch {
+        BRANCH_EXTERNAL => Ok(0),
+        BRANCH_INTERNAL => Ok(1),
+        _ => Err(Error::InvalidRequest("unknown derivation branch")),
+    }
+}
+
+/// Caches the two branch keys below a watch-only account key.
+///
+/// Deriving `branch/index` from the account key for every input and every change
+/// output repeats the `account -> branch` step every time. Holding those two
+/// keys turns the work for N addresses from 2N CKD steps into N+2.
+struct BranchPubCache<'a> {
+    secp: &'a Secp256k1<All>,
+    account: &'a ExtPubKey,
+    branches: [Option<ExtPubKey>; 2],
+}
+
+impl<'a> BranchPubCache<'a> {
+    fn new(secp: &'a Secp256k1<All>, account: &'a ExtPubKey) -> Self {
+        BranchPubCache {
+            secp,
+            account,
+            branches: [None, None],
+        }
+    }
+
+    fn pubkey_at(&mut self, branch: u32, index: u32) -> Result<[u8; 33], Error> {
+        let slot = branch_slot(branch)?;
+        if self.branches[slot].is_none() {
+            self.branches[slot] = Some(self.account.derive_child(self.secp, branch)?);
+        }
+        let branch_key = self.branches[slot].as_ref().expect("just populated");
+        Ok(branch_key
+            .derive_child(self.secp, index)?
+            .compressed_pubkey())
+    }
+
+    /// The P2PKH script the key at `branch/index` pays to.
+    fn script_at(&mut self, branch: u32, index: u32) -> Result<[u8; 25], Error> {
+        Ok(p2pkh_script(&hash160(&self.pubkey_at(branch, index)?)))
+    }
 }
 
 impl SignRequest {
@@ -316,6 +387,14 @@ impl SignRequest {
     /// (negative fee). The network would reject all of these too, but a signer
     /// must never even display them as if they were reviewable.
     pub fn validate(&self) -> Result<(), Error> {
+        // The version gate lives here as well as in decode_sign_request, because
+        // a SignRequest can also be constructed directly or decoded by other
+        // means, and the whole point of refusing version 1 is that the *sender*
+        // must not get to choose the weaker path. A gate only one entry point
+        // enforces is a gate.
+        if self.format_version != FORMAT_VERSION {
+            return Err(Error::UnsupportedVersion);
+        }
         if self.inputs.is_empty() || self.outputs.is_empty() {
             return Err(Error::InvalidRequest(
                 "transaction has no inputs or outputs",
@@ -439,6 +518,42 @@ impl SignRequest {
         self.verify_prev_txs()
     }
 
+    /// Compare the optional [`SignRequest::account_fp`] against the account key
+    /// actually supplied. `Ok(())` when it matches or when the package carries
+    /// none.
+    ///
+    /// A diagnostic, never a security control — the fingerprint comes from the
+    /// same untrusted companion as everything else. Its value is that "wrong
+    /// wallet open" reports [`Error::AccountMismatch`] instead of surfacing as a
+    /// late [`Error::ScriptMismatch`], which reads like tampering.
+    pub fn check_account_fp(&self, account: &ExtPubKey) -> Result<(), Error> {
+        match self.account_fp {
+            Some(fp) if fp != account.fingerprint() => Err(Error::AccountMismatch),
+            _ => Ok(()),
+        }
+    }
+
+    /// Prove that every output claiming to be ours really is: derive the key at
+    /// the path the companion supplied and require the output's script to be
+    /// exactly that key's P2PKH script.
+    ///
+    /// Shared by the review path and the signer so both enforce it identically.
+    fn prove_change_outputs(
+        &self,
+        secp: &Secp256k1<All>,
+        account: &ExtPubKey,
+    ) -> Result<(), Error> {
+        let mut cache = BranchPubCache::new(secp, account);
+        for o in &self.outputs {
+            if let (Some(branch), Some(index)) = (o.branch, o.index) {
+                if o.pk_script != cache.script_at(branch, index)? {
+                    return Err(Error::ScriptMismatch);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Trustless review: an output counts as change only when the device can
     /// PROVE it owns it, by deriving the key at the path the companion supplied
     /// and requiring it to produce exactly this output's script. Everything else
@@ -459,13 +574,20 @@ impl SignRequest {
     /// that does not derive to the script is a hard error, so a recipient can
     /// never be disguised as change.
     ///
-    /// Call [`SignRequest::validate`] first; it guarantees `is_change` agrees with
-    /// the presence of the path, so the two cannot disagree here.
+    /// Runs [`SignRequest::validate`] itself, so the numbers it reports are the
+    /// verified ones. It used to rely on the caller having done so; being the one
+    /// path whose whole purpose is putting amounts in front of a human, it is the
+    /// last place that should trust its input — an unvalidated package could drive
+    /// the fee subtraction below to overflow.
     pub fn review_owned(
         &self,
         secp: &Secp256k1<All>,
         account: &ExtPubKey,
     ) -> Result<ReviewSummary, Error> {
+        self.validate()?;
+        self.check_account_fp(account)?;
+        self.prove_change_outputs(secp, account)?;
+
         let display = |script: &[u8]| -> String {
             Address::from_script(script, account.network)
                 .map(|a| a.encode())
@@ -476,23 +598,17 @@ impl SignRequest {
         let mut change = Vec::new();
         for o in &self.outputs {
             let addr = display(&o.pk_script);
-            match (o.branch, o.index) {
-                (Some(branch), Some(index)) => {
-                    // Prove it: derive that exact key and require the output's script
-                    // to be its P2PKH script. Anything else means the companion
-                    // labelled someone else's output as our change.
-                    let pubkey = account.pubkey_at(secp, branch, index)?;
-                    if o.pk_script != p2pkh_script(&hash160(&pubkey)) {
-                        return Err(Error::ScriptMismatch);
-                    }
-                    change.push((addr, o.value));
-                }
-                _ => {
-                    recipients.push((addr, o.value));
-                }
+            // Ownership was proven above; validate() guarantees `is_change`
+            // agrees with the presence of the path, so the path alone classifies.
+            if o.branch.is_some() {
+                change.push((addr, o.value));
+            } else {
+                recipients.push((addr, o.value));
             }
         }
 
+        // validate() bounds both totals by MAX_ATOMS and rejects
+        // outputs > inputs, so this cannot overflow.
         let input_total = self.input_total();
         let output_total = self.output_total();
         Ok(ReviewSummary {
@@ -515,6 +631,8 @@ impl SignRequest {
         account: &ExtPubKey,
     ) -> Result<(), Error> {
         self.validate()?;
+        self.check_account_fp(account)?;
+        let mut cache = BranchPubCache::new(secp, account);
         for meta in &self.inputs {
             if meta.branch != BRANCH_EXTERNAL && meta.branch != BRANCH_INTERNAL {
                 return Err(Error::InvalidRequest("unknown derivation branch"));
@@ -527,13 +645,11 @@ impl SignRequest {
                     "only regular-tree outputs can be spent",
                 ));
             }
-            let pubkey = account.pubkey_at(secp, meta.branch, meta.index)?;
-            let expected = p2pkh_script(&hash160(&pubkey));
-            if meta.prev_script != expected {
+            if meta.prev_script != cache.script_at(meta.branch, meta.index)? {
                 return Err(Error::ScriptMismatch);
             }
         }
-        Ok(())
+        self.prove_change_outputs(secp, account)
     }
 }
 
@@ -556,6 +672,14 @@ pub fn sign_request(
     // if a caller skipped the review step.
     req.validate()?;
     let account = master.account_key(secp, req.account)?;
+    let account_pub = account.neuter(secp);
+    req.check_account_fp(&account_pub)?;
+    // Re-prove change ownership here too. validate() only checks that a change
+    // output *carries* a path in range, never that the path derives to the
+    // script; that proof lived solely in review_owned, so a caller that skipped
+    // the review could be walked into signing an attacker's address labelled as
+    // its own change. Same reasoning as the duplicated input checks below.
+    req.prove_change_outputs(secp, &account_pub)?;
 
     // Assemble the unsigned tx (sigScripts empty for sighash computation).
     let mut tx = MsgTx {
@@ -589,13 +713,19 @@ pub fn sign_request(
         expiry: req.expiry,
     };
 
+    // The prefix half of every SigHashAll sighash is the same for all inputs and
+    // is unaffected by the signature scripts filled in below, so it is computed
+    // once here. Recomputing it per input made signing O(N²) in the tx size.
+    let prefix_hash = prefix_hash_all(&tx);
+
+    // Branch keys, derived at most once each rather than per input.
+    let mut branch_keys: [Option<ExtPrivKey>; 2] = [None, None];
+
     // Sign each input. The structural checks duplicate check_owned_inputs on
     // purpose: the signer must refuse out-of-schema derivation paths and
     // stake-tree inputs on its own, even if a caller skipped the review step.
     for (idx, meta) in req.inputs.iter().enumerate() {
-        if meta.branch != BRANCH_EXTERNAL && meta.branch != BRANCH_INTERNAL {
-            return Err(Error::InvalidRequest("unknown derivation branch"));
-        }
+        let slot = branch_slot(meta.branch)?;
         if meta.index >= crate::hd::HARDENED {
             return Err(Error::InvalidRequest("hardened address index"));
         }
@@ -604,13 +734,25 @@ pub fn sign_request(
                 "only regular-tree outputs can be spent",
             ));
         }
-        let key = account.address_key(secp, meta.branch, meta.index)?;
+        if branch_keys[slot].is_none() {
+            branch_keys[slot] = Some(account.derive_child(secp, meta.branch)?);
+        }
+        let branch_key = branch_keys[slot].as_ref().expect("just populated");
+        let key = branch_key.derive_child(secp, meta.index)?;
         let pubkey = key.compressed_pubkey(secp);
         let expected_script = p2pkh_script(&hash160(&pubkey));
         if meta.prev_script != expected_script {
             return Err(Error::ScriptMismatch);
         }
-        let sig_script = sign_p2pkh_input(secp, &tx, idx, &expected_script, &key.secret, &pubkey)?;
+        let sig_script = sign_p2pkh_input_cached(
+            secp,
+            &tx,
+            idx,
+            &expected_script,
+            &key.secret,
+            &pubkey,
+            &prefix_hash,
+        )?;
         tx.tx_in[idx].signature_script = sig_script;
     }
 

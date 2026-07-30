@@ -136,12 +136,17 @@ impl ExtPrivKey {
     /// BIP32 CKDpriv. `index >= HARDENED` performs hardened derivation.
     pub fn derive_child(&self, secp: &Secp256k1<All>, index: u32) -> Result<Self, Error> {
         let depth = self.depth.checked_add(1).ok_or(Error::Derivation)?;
+        // One point multiplication, reused for both the non-hardened HMAC input
+        // and the child's parent fingerprint. Computing it twice (as an earlier
+        // version did) doubled the curve work of every non-hardened step, which
+        // is the hot path when deriving address keys.
+        let parent_pubkey = self.compressed_pubkey(secp);
         let mut mac = HmacSha512::new_from_slice(&self.chain_code).expect("hmac key");
         if index >= HARDENED {
             mac.update(&[0u8]);
             mac.update(&self.secret.secret_bytes());
         } else {
-            mac.update(&self.compressed_pubkey(secp));
+            mac.update(&parent_pubkey);
         }
         mac.update(&index.to_be_bytes());
         let mut i = mac.finalize().into_bytes();
@@ -157,12 +162,13 @@ impl ExtPrivKey {
         i.zeroize();
         let secret = secret.map_err(|_| Error::Derivation)?;
 
+        let h = crate::hashing::hash160(&parent_pubkey);
         Ok(ExtPrivKey {
             network: self.network,
             secret,
             chain_code,
             depth,
-            parent_fingerprint: self.fingerprint(secp),
+            parent_fingerprint: [h[0], h[1], h[2], h[3]],
             child_number: index,
         })
     }
@@ -189,12 +195,21 @@ impl ExtPrivKey {
     }
 
     /// Address key at `.../branch/index` relative to an account key.
+    ///
+    /// Both components must be non-hardened: a watch-only companion holding only
+    /// the account `dpub` has to be able to derive the same address, which it
+    /// cannot do for a hardened index. Rejecting them here keeps the private and
+    /// public sides of the wallet in agreement instead of silently producing a
+    /// key the companion can never see.
     pub fn address_key(
         &self,
         secp: &Secp256k1<All>,
         branch: u32,
         index: u32,
     ) -> Result<Self, Error> {
+        if branch >= HARDENED || index >= HARDENED {
+            return Err(Error::HardenedIndex);
+        }
         self.derive_path(secp, &[branch, index])
     }
 
@@ -419,23 +434,32 @@ struct RawExtKey {
 }
 
 fn parse_ext_key(s: &str) -> Result<RawExtKey, Error> {
-    let mut raw = bs58::decode(s).into_vec().map_err(|_| Error::Base58)?;
-    if raw.len() != 82 {
+    // Length-gate before the quadratic base58 decode.
+    if s.len() > crate::hashing::MAX_BASE58_LEN {
         return Err(Error::Parse);
     }
-    let (body, cksum) = raw.split_at(78);
-    if blake256::sum256d(body)[..4] != *cksum {
-        return Err(Error::BadChecksum);
-    }
-    let key = RawExtKey {
-        version: body[0..4].try_into().unwrap(),
-        depth: body[4],
-        parent_fingerprint: body[5..9].try_into().unwrap(),
-        child_number: u32::from_be_bytes(body[9..13].try_into().unwrap()),
-        chain_code: body[13..45].try_into().unwrap(),
-        key_data: body[45..78].try_into().unwrap(),
-    };
-    // For a dprv this Vec held the raw secret; wipe unconditionally (cheap).
+    let mut raw = bs58::decode(s).into_vec().map_err(|_| Error::Base58)?;
+    // For a dprv this Vec holds the raw secret, so *every* exit has to wipe it.
+    // The checks below therefore run inside a closure: written as early returns
+    // they fell out of the function before reaching the wipe, leaving a decoded
+    // secret in freed heap whenever the length or checksum was wrong.
+    let key = (|| {
+        if raw.len() != 82 {
+            return Err(Error::Parse);
+        }
+        let (body, cksum) = raw.split_at(78);
+        if blake256::sum256d(body)[..4] != *cksum {
+            return Err(Error::BadChecksum);
+        }
+        Ok(RawExtKey {
+            version: body[0..4].try_into().unwrap(),
+            depth: body[4],
+            parent_fingerprint: body[5..9].try_into().unwrap(),
+            child_number: u32::from_be_bytes(body[9..13].try_into().unwrap()),
+            chain_code: body[13..45].try_into().unwrap(),
+            key_data: body[45..78].try_into().unwrap(),
+        })
+    })();
     raw.zeroize();
-    Ok(key)
+    key
 }

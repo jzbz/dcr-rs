@@ -798,3 +798,150 @@ fn sign_request_refuses_prev_script_mismatch() {
 
     assert_eq!(sign_request(&secp, &m, &req), Err(Error::ScriptMismatch));
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests for the review pass. Each of these failed before the fix
+// named in its doc comment.
+// ---------------------------------------------------------------------------
+
+/// `review_owned` must validate its own input.
+///
+/// It was the only entry point that did not, relying on a doc comment telling
+/// callers to run `validate` first — and it is the one path whose entire job is
+/// putting amounts in front of a human. On an unvalidated package its
+/// `input_total - output_total` overflowed: inputs saturating to `i64::MAX` and
+/// outputs to `i64::MIN` panicked in debug and, worse, silently wrapped in
+/// release, so the fee on screen was arbitrary.
+#[test]
+fn review_owned_validates_its_own_input() {
+    let secp = Secp256k1::new();
+    let m = master();
+    let account = account_pub(&secp, &m);
+
+    let saturating_input = |tag: u8| InputMeta {
+        prev_hash: [tag; 32],
+        prev_index: 0,
+        tree: 0,
+        sequence: 0,
+        value_in: i64::MAX,
+        branch: BRANCH_EXTERNAL,
+        index: 0,
+        prev_script: Vec::new(),
+        prev_tx: None,
+    };
+    let req = SignRequest {
+        format_version: FORMAT_VERSION,
+        tx_version: 1,
+        account: 0,
+        lock_time: 0,
+        expiry: 0,
+        inputs: vec![saturating_input(1), saturating_input(2)],
+        outputs: vec![
+            recipient(i64::MIN, foreign_script(0xaa)),
+            recipient(i64::MIN, foreign_script(0xbb)),
+        ],
+        account_fp: None,
+    };
+
+    // Must be a clean refusal, not a panic and not a wrapped fee.
+    assert!(
+        matches!(
+            req.review_owned(&secp, &account),
+            Err(Error::InvalidRequest(_))
+        ),
+        "the display path must refuse a package whose math cannot be honest"
+    );
+}
+
+/// `sign_request` must re-prove change ownership itself.
+///
+/// `validate` only checks that a change output *carries* a path in range, never
+/// that the path derives to the script; that proof lived solely in
+/// `review_owned`. So a caller that skipped the review step — which the signer
+/// explicitly does not assume, hence its duplicated input checks — could be
+/// walked into signing an attacker's address labelled as its own change.
+#[test]
+fn sign_request_reproves_change_ownership() {
+    let secp = Secp256k1::new();
+    let m = master();
+    let acct = m.account_key(&secp, 0).unwrap();
+    let input_key = acct.address_key(&secp, BRANCH_EXTERNAL, 0).unwrap();
+    let input_script = p2pkh_script(&hash160(&input_key.compressed_pubkey(&secp))).to_vec();
+
+    // An in-range path, but pointing at a script that is not ours.
+    let req = basic_request(
+        input_script,
+        vec![change_at(90_000, foreign_script(0xcc), BRANCH_INTERNAL, 5)],
+    );
+    req.validate()
+        .expect("structurally valid — validate cannot see the lie");
+    assert_eq!(
+        sign_request(&secp, &m, &req),
+        Err(Error::ScriptMismatch),
+        "the signer must not sign a foreign output labelled as change"
+    );
+}
+
+/// The `FORMAT_VERSION` gate has to live in `validate`, not only in
+/// `decode_sign_request`: a `SignRequest` can be built directly or decoded by
+/// other means, and the whole reason version 1 is refused is that the *sender*
+/// must not get to pick the weaker path.
+#[test]
+fn validate_enforces_the_format_version_gate() {
+    let mut req = basic_request(
+        foreign_script(0xaa),
+        vec![recipient(90_000, foreign_script(0xbb))],
+    );
+    req.validate().expect("version 2 package is fine");
+
+    for bad in [0, 1, FORMAT_VERSION + 1] {
+        req.format_version = bad;
+        assert_eq!(
+            req.validate(),
+            Err(Error::UnsupportedVersion),
+            "validate must refuse format version {bad}"
+        );
+    }
+}
+
+/// `account_fp`, when present, is compared against the account key actually
+/// supplied. It is a diagnostic — the `prev_script` re-derivation is what
+/// protects funds — but it turns "wrong wallet open" into a specific error
+/// instead of a late `ScriptMismatch` that reads like tampering.
+#[test]
+fn account_fp_mismatch_is_reported_as_such() {
+    let secp = Secp256k1::new();
+    let m = master();
+    let account = account_pub(&secp, &m);
+    let acct = m.account_key(&secp, 0).unwrap();
+    let input_key = acct.address_key(&secp, BRANCH_EXTERNAL, 0).unwrap();
+    let input_script = p2pkh_script(&hash160(&input_key.compressed_pubkey(&secp))).to_vec();
+
+    let mut req = basic_request(input_script, vec![recipient(90_000, foreign_script(0xbb))]);
+
+    // Absent: no check, everything proceeds.
+    assert_eq!(req.check_account_fp(&account), Ok(()));
+
+    // Correct: accepted.
+    req.account_fp = Some(account.fingerprint());
+    assert_eq!(req.check_account_fp(&account), Ok(()));
+    assert!(req.review_owned(&secp, &account).is_ok());
+
+    // Wrong: a specific error, and the review path surfaces it.
+    req.account_fp = Some([0xde, 0xad, 0xbe, 0xef]);
+    assert_eq!(req.check_account_fp(&account), Err(Error::AccountMismatch));
+    assert!(matches!(
+        req.review_owned(&secp, &account),
+        Err(Error::AccountMismatch)
+    ));
+}
+
+/// An oversized CBOR package is refused before minicbor allocates for it.
+#[test]
+fn decode_rejects_oversized_packages() {
+    let huge = vec![0u8; dcr_rs::airgap::MAX_PACKAGE_BYTES + 1];
+    assert!(matches!(
+        decode_sign_request(&huge),
+        Err(Error::InvalidRequest(_))
+    ));
+}

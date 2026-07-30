@@ -64,6 +64,14 @@ pub enum Error {
     /// A hardened child was requested from an extended *public* key, which is
     /// cryptographically impossible.
     HardenedFromPublic,
+    /// A hardened index was supplied where only a non-hardened one is meaningful
+    /// — a `branch`/`index` below an account key, which a watch-only companion
+    /// holding the account `dpub` must be able to reproduce.
+    HardenedIndex,
+    /// The airgap package was built against a different account key than the one
+    /// supplied (its `account_fp` does not match). A diagnostic, not a security
+    /// control: the `prev_script` re-derivation is what protects funds.
+    AccountMismatch,
     /// A byte buffer could not be parsed (short read, bad varint, malformed
     /// tx, wrong payload length).
     Parse,
@@ -92,6 +100,8 @@ impl core::fmt::Display for Error {
         let s = match self {
             Error::Derivation => "key derivation failed",
             Error::HardenedFromPublic => "cannot derive a hardened child from a public key",
+            Error::HardenedIndex => "hardened index where a non-hardened one is required",
+            Error::AccountMismatch => "package was built for a different account key",
             Error::Parse => "could not parse data",
             Error::Base58 => "invalid base58 string",
             Error::BadChecksum => "base58check checksum mismatch",

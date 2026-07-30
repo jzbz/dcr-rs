@@ -36,8 +36,21 @@ pub fn check_encode(payload: &[u8], prefix: [u8; 2]) -> String {
     bs58::encode(buf).into_string()
 }
 
+/// Longest base58 string this crate will decode.
+///
+/// Base58 decoding is quadratic in the input length, so an unbounded string is a
+/// cheap way to stall a signer that decodes whatever a QR code contained — a
+/// 128 KB string already costs seconds. Everything here is far shorter: an
+/// address is ~35 characters and the longest, an 82-byte extended key, is 112.
+pub const MAX_BASE58_LEN: usize = 128;
+
 /// Decode and verify a base58check string, returning `(2-byte prefix, payload)`.
+///
+/// Rejects anything longer than [`MAX_BASE58_LEN`] before decoding.
 pub fn check_decode(s: &str) -> Result<([u8; 2], Vec<u8>), Error> {
+    if s.len() > MAX_BASE58_LEN {
+        return Err(Error::Parse);
+    }
     let raw = bs58::decode(s).into_vec().map_err(|_| Error::Base58)?;
     if raw.len() < 6 {
         return Err(Error::Parse);

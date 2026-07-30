@@ -112,3 +112,132 @@ fn onchain_txid_matches() {
         "37564c16ef112d03c1fd44df93c0fd2703b057580797de6489463bcabfe5d954"
     );
 }
+
+/// Non-canonical compact-size varints must be refused, as dcrd's
+/// `wire.ReadVarInt` does (`ErrNonCanonicalVarInt`).
+///
+/// Without this check two distinct byte strings decode to the same transaction,
+/// so `parse_full` is not the inverse of `serialize_full` and a signer accepts
+/// bytes the network rejects. Re-encoding the real fixture's input count `0x02`
+/// as the three-byte `0xfd 0x0002` is the minimal case.
+#[test]
+fn parse_full_rejects_non_canonical_varints() {
+    let raw = hex::decode(SPEND_TX_HEX).unwrap();
+    assert_eq!(
+        raw[4], 0x02,
+        "fixture layout check (2 inputs, 1-byte count)"
+    );
+
+    let mut evil = Vec::new();
+    evil.extend_from_slice(&raw[..4]);
+    evil.extend_from_slice(&[0xfd, 0x02, 0x00]); // 2, encoded non-minimally
+    evil.extend_from_slice(&raw[5..]);
+    assert!(
+        MsgTx::parse_full(&evil).is_err(),
+        "a 3-byte encoding of 2 must be refused"
+    );
+
+    // The same value in its shortest form still parses.
+    assert!(MsgTx::parse_full(&raw).is_ok());
+
+    // And every wider encoding of a small count is refused too.
+    for wide in [
+        vec![0xfe, 0x02, 0x00, 0x00, 0x00],
+        vec![0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    ] {
+        let mut evil = Vec::new();
+        evil.extend_from_slice(&raw[..4]);
+        evil.extend_from_slice(&wide);
+        evil.extend_from_slice(&raw[5..]);
+        assert!(MsgTx::parse_full(&evil).is_err());
+    }
+}
+
+/// Trailing bytes after a complete transaction must be refused. They are
+/// invisible to `serialize_full`, so accepting them would make `parse_full`
+/// non-injective the same way a non-canonical varint does.
+#[test]
+fn parse_full_rejects_trailing_bytes() {
+    let raw = hex::decode(SPEND_TX_HEX).unwrap();
+    for tail in [vec![0x00], vec![0xde, 0xad, 0xbe, 0xef]] {
+        let mut padded = raw.clone();
+        padded.extend_from_slice(&tail);
+        assert!(
+            MsgTx::parse_full(&padded).is_err(),
+            "{} trailing byte(s) must be refused",
+            tail.len()
+        );
+    }
+}
+
+/// `parse_prefix` reads the prefix-only serialization, which is all that is
+/// needed to recompute a txid — and is ~40% of the bytes of a full transaction,
+/// since it carries no signature scripts.
+#[test]
+fn parse_prefix_reproduces_the_mainnet_txid() {
+    let full = MsgTx::parse_full(&hex::decode(SPEND_TX_HEX).unwrap()).expect("parse full");
+    let prefix_bytes = full.serialize_prefix();
+
+    let from_prefix = MsgTx::parse_prefix(&prefix_bytes).expect("parse prefix");
+    assert_eq!(
+        from_prefix.tx_hash(),
+        full.tx_hash(),
+        "the txid is a function of the prefix alone"
+    );
+    assert_eq!(from_prefix.tx_out, full.tx_out, "outputs survive verbatim");
+    assert_eq!(from_prefix.tx_in.len(), full.tx_in.len());
+    for (a, b) in from_prefix.tx_in.iter().zip(&full.tx_in) {
+        assert_eq!(a.previous_outpoint, b.previous_outpoint);
+        assert_eq!(a.sequence, b.sequence);
+    }
+    assert_eq!(from_prefix.serialize_prefix(), prefix_bytes, "byte-exact");
+
+    // Strictness applies here too.
+    let mut padded = prefix_bytes.clone();
+    padded.push(0x00);
+    assert!(MsgTx::parse_prefix(&padded).is_err());
+    // A full serialization is not a prefix serialization.
+    assert!(MsgTx::parse_prefix(&full.serialize_full()).is_err());
+}
+
+/// The prefix half of a SigHashAll sighash is the transaction's txid, is
+/// independent of which input is signed, and is unaffected by signature scripts
+/// (those live in the witness). That is what lets it be hoisted out of the
+/// signing loop, turning O(N²) work into O(N).
+///
+/// Checked against the real mainnet fixture, whose inputs already carry their
+/// signature scripts — the case where a stale cache would show up.
+#[test]
+fn cached_prefix_hash_matches_the_uncached_sighash() {
+    use dcr_rs::sighash::{prefix_hash_all, signature_hash_all_cached};
+
+    let mut tx = MsgTx::parse_full(&hex::decode(SPEND_TX_HEX).unwrap()).expect("parse");
+    assert!(
+        tx.tx_in.iter().all(|i| !i.signature_script.is_empty()),
+        "fixture inputs carry signature scripts"
+    );
+
+    let prefix = prefix_hash_all(&tx);
+    assert_eq!(prefix, tx.tx_hash(), "the prefix hash IS the txid");
+
+    for (idx, prevout_hex) in PREVOUT_SCRIPTS.iter().enumerate() {
+        let script = hex::decode(prevout_hex).unwrap();
+        assert_eq!(
+            signature_hash_all_cached(&tx, idx, &script, &prefix).unwrap(),
+            signature_hash_all(&tx, idx, &script).unwrap(),
+        );
+    }
+
+    // Clearing the signature scripts must not move the prefix hash.
+    for ti in tx.tx_in.iter_mut() {
+        ti.signature_script.clear();
+    }
+    assert_eq!(
+        prefix_hash_all(&tx),
+        prefix,
+        "signature scripts are not committed by the prefix"
+    );
+
+    // An out-of-range index is still refused on the cached path.
+    assert!(signature_hash_all_cached(&tx, 99, &[], &prefix).is_err());
+}
