@@ -10,7 +10,7 @@
 
 use alloc::vec::Vec;
 
-use secp256k1::{ecdsa::Signature, All, Message, Secp256k1, SecretKey};
+use secp256k1::{ecdsa::Signature, All, Message, PublicKey, Secp256k1, SecretKey};
 
 use crate::address::p2pkh_script;
 use crate::hashing::hash160;
@@ -20,10 +20,18 @@ use crate::Error;
 
 /// Sign input `idx` (P2PKH) and return the complete signature script.
 ///
-/// `prevout_script` must be the P2PKH script of `compressed_pubkey`; the pair is
-/// checked before signing, so a caller cannot accidentally produce a sigScript
-/// whose pubkey does not satisfy the script being spent (which would yield an
-/// unspendable transaction the network silently rejects).
+/// The public key published in the script is derived from `secret` here rather
+/// than supplied by the caller, so the two cannot disagree. `prevout_script` must
+/// be the P2PKH script of that key, and is checked: together those make it
+/// impossible to produce a well-formed-looking sigScript that does not actually
+/// satisfy the script being spent.
+///
+/// That combination matters because the failure is otherwise invisible. A
+/// signature made by key A published alongside key B's pubkey is canonical DER,
+/// low-S, and exactly the usual 107 bytes; nothing about it looks wrong until
+/// every node rejects the transaction with "false stack entry at end of script
+/// execution", or the companion silently drops it and the payment simply never
+/// confirms.
 ///
 /// When signing more than one input, use [`sign_p2pkh_input_cached`] so the
 /// input-independent half of the sighash is computed once.
@@ -33,17 +41,8 @@ pub fn sign_p2pkh_input(
     idx: usize,
     prevout_script: &[u8],
     secret: &SecretKey,
-    compressed_pubkey: &[u8; 33],
 ) -> Result<Vec<u8>, Error> {
-    sign_p2pkh_input_cached(
-        secp,
-        tx,
-        idx,
-        prevout_script,
-        secret,
-        compressed_pubkey,
-        &prefix_hash_all(tx),
-    )
+    sign_p2pkh_input_cached(secp, tx, idx, prevout_script, secret, &prefix_hash_all(tx))
 }
 
 /// [`sign_p2pkh_input`] with the input-independent prefix hash supplied by the
@@ -55,12 +54,13 @@ pub fn sign_p2pkh_input_cached(
     idx: usize,
     prevout_script: &[u8],
     secret: &SecretKey,
-    compressed_pubkey: &[u8; 33],
     prefix_hash: &[u8; 32],
 ) -> Result<Vec<u8>, Error> {
-    // Bind the pubkey we are about to publish to the script we are signing for.
-    // One hash160, no curve work — cheap enough to be unconditional.
-    if prevout_script != p2pkh_script(&hash160(compressed_pubkey)) {
+    // Derive the pubkey from the signing key, then bind it to the script being
+    // spent. One point multiplication and one hash160 — the same multiplication
+    // the caller would otherwise have done to build the script.
+    let compressed_pubkey = PublicKey::from_secret_key(secp, secret).serialize();
+    if prevout_script != p2pkh_script(&hash160(&compressed_pubkey)) {
         return Err(Error::ScriptMismatch);
     }
 
@@ -70,7 +70,7 @@ pub fn sign_p2pkh_input_cached(
     // Defense in depth — normalize even though sign_ecdsa already produces low-S.
     sig.normalize_s();
 
-    Ok(build_sig_script(&sig, compressed_pubkey))
+    Ok(build_sig_script(&sig, &compressed_pubkey))
 }
 
 /// `PUSH(der ‖ hashType) PUSH(pubkey)` with canonical single-byte pushes (a DER

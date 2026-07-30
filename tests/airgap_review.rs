@@ -1056,3 +1056,223 @@ fn prev_tx_prefix_refuses_a_full_serialization() {
     // The prefix really is the smaller half.
     assert!(tx.serialize_prefix().len() < tx.serialize_full().len());
 }
+
+/// `review_owned` must prove INPUT ownership, not just output ownership.
+///
+/// `verify_prev_txs` proves an input's amount is real; it says nothing about whose
+/// coin it is. So a foreign input with a genuine funding transaction used to pass
+/// review, and `input_total`/`fee` were sums over coins the device had not
+/// established it controlled — inflating the total a user is shown and making an
+/// outsized fee look proportionate to it. `sign_request` refused later, but a
+/// firmware that reviews with dcr-rs and signs with its own code never saw that.
+#[test]
+fn review_owned_proves_input_ownership() {
+    let secp = Secp256k1::new();
+    let m = master();
+    let account = account_pub(&secp, &m);
+    let acct = m.account_key(&secp, 0).unwrap();
+
+    // Input 0: genuinely ours.
+    let own_key = acct.address_key(&secp, BRANCH_EXTERNAL, 0).unwrap();
+    let own_script = p2pkh_script(&hash160(&own_key.compressed_pubkey(&secp))).to_vec();
+    let (own_hash, own_prefix) = funding_for(100_000, &own_script);
+
+    // Input 1: someone else's coin, with a REAL funding transaction, so
+    // verify_prev_txs is perfectly happy with it.
+    let foreign = p2pkh_script(&[0xcd; 20]).to_vec();
+    let (foreign_hash, foreign_prefix) = funding_for(500_000, &foreign);
+
+    let mk = |hash, script: Vec<u8>, prefix, value, index| InputMeta {
+        prev_hash: hash,
+        prev_index: 0,
+        tree: 0,
+        sequence: 0xffff_ffff,
+        value_in: value,
+        branch: BRANCH_EXTERNAL,
+        index,
+        prev_script: script,
+        prev_tx_prefix: Some(prefix),
+    };
+
+    let req = SignRequest {
+        format_version: FORMAT_VERSION,
+        tx_version: 1,
+        account: 0,
+        lock_time: 0,
+        expiry: 0,
+        inputs: vec![
+            mk(own_hash, own_script, own_prefix, 100_000, 0),
+            mk(foreign_hash, foreign, foreign_prefix, 500_000, 1),
+        ],
+        outputs: vec![recipient(590_000, foreign_script(0xbb))],
+        account_fp: None,
+    };
+
+    // Structurally fine, and the amounts genuinely check out against the funding
+    // transactions — the lie is purely about ownership.
+    req.validate()
+        .expect("amounts verify; only ownership is false");
+
+    assert!(
+        matches!(
+            req.review_owned(&secp, &account),
+            Err(Error::ScriptMismatch)
+        ),
+        "the display path must refuse an input it cannot derive"
+    );
+    // The other two entry points agree.
+    assert!(matches!(
+        req.check_owned_inputs(&secp, &account),
+        Err(Error::ScriptMismatch)
+    ));
+    assert_eq!(sign_request(&secp, &m, &req), Err(Error::ScriptMismatch));
+}
+
+/// `sign_p2pkh_input` derives the published pubkey from the signing key itself, so
+/// a signature made by one key can no longer be published alongside another key's
+/// pubkey — a combination that produced a canonical, normal-length, completely
+/// unspendable sigScript.
+#[test]
+fn signing_binds_the_key_to_the_script() {
+    use dcr_rs::sign::sign_p2pkh_input;
+
+    let secp = Secp256k1::new();
+    let m = master();
+    let acct = m.account_key(&secp, 0).unwrap();
+    let key_a = acct.address_key(&secp, BRANCH_EXTERNAL, 0).unwrap();
+    let key_b = acct.address_key(&secp, BRANCH_EXTERNAL, 1).unwrap();
+    let script_a = p2pkh_script(&hash160(&key_a.compressed_pubkey(&secp))).to_vec();
+
+    let tx = MsgTx {
+        version: 1,
+        tx_in: vec![TxIn {
+            previous_outpoint: OutPoint {
+                hash: [3u8; 32],
+                index: 0,
+                tree: 0,
+            },
+            sequence: 0xffff_ffff,
+            value_in: 100_000,
+            block_height: 0,
+            block_index: 0xffff_ffff,
+            signature_script: Vec::new(),
+        }],
+        tx_out: vec![TxOut {
+            value: 90_000,
+            version: 0,
+            pk_script: foreign_script(0xaa),
+        }],
+        lock_time: 0,
+        expiry: 0,
+    };
+
+    // The matching key signs, and the sigScript publishes exactly its own pubkey.
+    let ss = sign_p2pkh_input(&secp, &tx, 0, &script_a, &key_a.secret).expect("matching key signs");
+    let pk_len = ss[ss.len() - 34] as usize;
+    assert_eq!(pk_len, 33);
+    assert_eq!(
+        &ss[ss.len() - 33..],
+        &key_a.compressed_pubkey(&secp)[..],
+        "the published pubkey must be the signing key's own"
+    );
+
+    // A different key for the same script is refused rather than producing a
+    // plausible-looking, unspendable script.
+    assert_eq!(
+        sign_p2pkh_input(&secp, &tx, 0, &script_a, &key_b.secret),
+        Err(Error::ScriptMismatch)
+    );
+
+    // Out-of-range input index still errors on the un-cached path.
+    assert_eq!(
+        sign_p2pkh_input(&secp, &tx, 9, &script_a, &key_a.secret),
+        Err(Error::SigHashIndex)
+    );
+}
+
+/// Pins the shared-funder ceiling documented on `MAX_PACKAGE_BYTES`.
+///
+/// `prev_tx_prefix` is per-input and nothing deduplicates it, so inputs spending
+/// several outputs of one large transaction each carry a copy of it. The advertised
+/// `MAX_INPUTS` is therefore unreachable for that shape. It fails closed, which is
+/// why this is a documented limit rather than a bug, but it should not be able to
+/// change silently.
+#[test]
+fn shared_funder_package_size_is_the_binding_limit() {
+    use dcr_rs::airgap::{MAX_INPUTS, MAX_PACKAGE_BYTES};
+
+    let script = p2pkh_script(&[0x5a; 20]).to_vec();
+    // One funding transaction with many outputs, as a payout transaction has.
+    let funder = MsgTx {
+        version: 1,
+        tx_in: vec![TxIn {
+            previous_outpoint: OutPoint {
+                hash: [1u8; 32],
+                index: 0,
+                tree: 0,
+            },
+            sequence: 0xffff_ffff,
+            value_in: 1_000_000_000,
+            block_height: 0,
+            block_index: 0xffff_ffff,
+            signature_script: vec![0x5a; 107],
+        }],
+        tx_out: (0..1000)
+            .map(|_| TxOut {
+                value: 1_000_000,
+                version: 0,
+                pk_script: script.clone(),
+            })
+            .collect(),
+        lock_time: 0,
+        expiry: 0,
+    };
+    let prefix = funder.serialize_prefix();
+    let hash = funder.tx_hash();
+
+    let package_for = |n: usize| {
+        let req = SignRequest {
+            format_version: FORMAT_VERSION,
+            tx_version: 1,
+            account: 0,
+            lock_time: 0,
+            expiry: 0,
+            inputs: (0..n)
+                .map(|i| InputMeta {
+                    prev_hash: hash,
+                    prev_index: i as u32,
+                    tree: 0,
+                    sequence: 0xffff_ffff,
+                    value_in: 1_000_000,
+                    branch: BRANCH_EXTERNAL,
+                    index: i as u32,
+                    prev_script: script.clone(),
+                    prev_tx_prefix: Some(prefix.clone()),
+                })
+                .collect(),
+            outputs: vec![recipient(1_000_000 * n as i64 - 20_000, script.clone())],
+            account_fp: None,
+        };
+        encode_sign_request(&req).unwrap()
+    };
+
+    // A handful of inputs from a large funder is fine...
+    let small = package_for(5);
+    assert!(small.len() < MAX_PACKAGE_BYTES);
+    assert!(decode_sign_request(&small).is_ok());
+
+    // ...but nowhere near MAX_INPUTS (1000): each input repeats the whole 36 KB
+    // prefix, so the size cap binds first by two orders of magnitude.
+    assert_eq!(MAX_INPUTS, 1000);
+    let large = package_for(20);
+    assert!(
+        large.len() > MAX_PACKAGE_BYTES,
+        "20 inputs sharing a 1000-output funder should exceed the cap ({} B)",
+        large.len()
+    );
+    // Fails closed, with the size error rather than anything unsafe.
+    assert!(matches!(
+        decode_sign_request(&large),
+        Err(Error::InvalidRequest(m)) if m.contains("too large")
+    ));
+}

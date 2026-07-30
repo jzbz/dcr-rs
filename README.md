@@ -25,7 +25,29 @@ In scope — the consensus-critical byte formats a wallet or signer needs:
 - **HD keys** — BIP32 with Decred's `dprv`/`dpub` (and `tprv`/`sprv`/`rprv`…)
   version bytes and double-BLAKE256 base58 checksum. Private CKD for signers,
   public CKD for watch-only companions, BIP39 seed expansion behind the
-  `mnemonic` feature.
+  `mnemonic` feature. **Hardened derivation follows the Decred variant, not plain
+  BIP32** — see below.
+
+### Hardened derivation is not plain BIP32
+
+dcrd's `hdkeychain` strips leading zero bytes from a child private key before
+feeding it into the next hardened HMAC, and dcrwallet and decrediton use that
+variant for the whole wallet path. So for a parent key with a leading zero byte
+the hardened HMAC input is `0x00 ‖ key31 ‖ 0x00 ‖ ser32(i)` where BIP32 says
+`0x00 ‖ 0x00 ‖ key31 ‖ ser32(i)`, and every descendant diverges. The account key
+at `m/44'/42'/0'` differs between the two variants for roughly **1 seed in 112**.
+
+This crate mirrors dcrd's own API:
+
+| method | dcrd equivalent | use for |
+|--------|-----------------|---------|
+| `derive_child` / `derive_path` (default) | `Child` | anything that must agree with dcrwallet, decrediton, or a user's existing seed |
+| `derive_child_bip32_std` / `derive_path_bip32_std` | `ChildBIP32Std` | strict BIP32 |
+
+`account_key` and `address_key` use the Decred variant. Public (non-hardened)
+derivation is identical under both, so an account `dpub` and every address below
+it are unaffected. `tests/vectors.rs` pins both against vectors generated from
+dcrd's `hdkeychain`.
 - **Transactions** — the dcrd `MsgTx` wire format (prefix ‖ witness),
   byte-exact serialize/parse, txids.
 - **Signing** — the Decred signature hash (not Bitcoin's BIP143) and

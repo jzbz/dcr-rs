@@ -250,17 +250,34 @@ pub fn encode_sign_request(req: &SignRequest) -> Result<Vec<u8>, Error> {
 ///
 /// Decoding untrusted CBOR amplifies: skipping over an unexpected nested
 /// structure allocates per item, so peak heap is a multiple of the input. This is
-/// the backstop that keeps that multiple finite — nothing more. It is chosen to
-/// sit above what [`MAX_INPUTS`] actually costs, so that the two limits do not
-/// contradict each other: at format version 3 a 1000-input package carrying a
-/// typical 2-in/2-out funding prefix per input measures ~248 KB, so 512 KiB
-/// admits the largest package `MAX_INPUTS` permits with room to spare and
-/// rejects everything beyond it. Version 2 needed four times as much.
+/// the backstop that keeps that multiple finite — nothing more.
 ///
-/// A device with tight RAM should impose its own, much lower, limit before
-/// calling [`decode_sign_request`] — neither QR transport nor a few hundred KB of
-/// heap can handle a package anywhere near this size, and only the application
-/// knows its real budget.
+/// **This, not [`MAX_INPUTS`], is the binding limit when inputs share a funding
+/// transaction.** [`InputMeta::prev_tx_prefix`] is per-input and nothing
+/// deduplicates it, so N inputs spending N outputs of the *same* transaction
+/// carry N copies of it. Measured at format version 3:
+///
+/// ```text
+/// funder shape              inputs   package
+/// 2 outputs (127 B)           1000   204 KiB   ok
+/// 1000 outputs (36 KiB)          5   176 KiB   ok
+/// 1000 outputs (36 KiB)         15   529 KiB   refused
+/// 250 outputs (9 KiB)          100   892 KiB   refused
+/// ```
+///
+/// So a consolidation of coins from one large payout — a mining-pool transaction
+/// with hundreds of outputs, exactly the case that most wants consolidating —
+/// tops out around 14 inputs, not `MAX_INPUTS`. It fails closed, with
+/// `InvalidRequest("package too large")` rather than anything unsafe, but the
+/// advertised capacity is unreachable for that shape and a companion has to split
+/// the spend across packages. Deduplicating the funding transactions (a
+/// package-level table each input indexes into) would fix it, and is a wire change
+/// for a future format version.
+///
+/// A device with tight RAM should impose its own, much lower, limit before calling
+/// [`decode_sign_request`] — neither QR transport nor a few hundred KB of heap can
+/// handle a package anywhere near this size, and only the application knows its
+/// real budget.
 pub const MAX_PACKAGE_BYTES: usize = 512 * 1024;
 
 /// Decode a sign request, enforcing the size and format-version gates.
@@ -602,6 +619,30 @@ impl SignRequest {
         Ok(())
     }
 
+    /// Prove that every input spends a coin this wallet controls: the claimed
+    /// `prev_script` must equal the P2PKH script of the key derived at
+    /// `branch/index` below the account key.
+    ///
+    /// `verify_prev_txs` proves an input's *amount* is real; only this proves the
+    /// coin is ours. Both matter to the review path, because `input_total` and the
+    /// fee derived from it are sums over these inputs — a foreign input with a
+    /// genuine funding transaction would otherwise inflate the total a user is
+    /// shown and make an outsized fee look proportionate.
+    fn prove_owned_inputs(&self, secp: &Secp256k1<All>, account: &ExtPubKey) -> Result<(), Error> {
+        let mut cache = BranchPubCache::new(secp, account);
+        for meta in &self.inputs {
+            if meta.tree != 0 {
+                return Err(Error::InvalidRequest(
+                    "only regular-tree outputs can be spent",
+                ));
+            }
+            if meta.prev_script != cache.script_at(meta.branch, meta.index)? {
+                return Err(Error::ScriptMismatch);
+            }
+        }
+        Ok(())
+    }
+
     /// Trustless review: an output counts as change only when the device can
     /// PROVE it owns it, by deriving the key at the path the companion supplied
     /// and requiring it to produce exactly this output's script. Everything else
@@ -634,6 +675,7 @@ impl SignRequest {
     ) -> Result<ReviewSummary, Error> {
         self.validate()?;
         self.check_account_fp(account)?;
+        self.prove_owned_inputs(secp, account)?;
         self.prove_change_outputs(secp, account)?;
 
         let display = |script: &[u8]| -> String {
@@ -680,23 +722,7 @@ impl SignRequest {
     ) -> Result<(), Error> {
         self.validate()?;
         self.check_account_fp(account)?;
-        let mut cache = BranchPubCache::new(secp, account);
-        for meta in &self.inputs {
-            if meta.branch != BRANCH_EXTERNAL && meta.branch != BRANCH_INTERNAL {
-                return Err(Error::InvalidRequest("unknown derivation branch"));
-            }
-            if meta.index >= crate::hd::HARDENED {
-                return Err(Error::InvalidRequest("hardened address index"));
-            }
-            if meta.tree != 0 {
-                return Err(Error::InvalidRequest(
-                    "only regular-tree outputs can be spent",
-                ));
-            }
-            if meta.prev_script != cache.script_at(meta.branch, meta.index)? {
-                return Err(Error::ScriptMismatch);
-            }
-        }
+        self.prove_owned_inputs(secp, account)?;
         self.prove_change_outputs(secp, account)
     }
 }
@@ -787,20 +813,12 @@ pub fn sign_request(
         }
         let branch_key = branch_keys[slot].as_ref().expect("just populated");
         let key = branch_key.derive_child(secp, meta.index)?;
-        let pubkey = key.compressed_pubkey(secp);
-        let expected_script = p2pkh_script(&hash160(&pubkey));
-        if meta.prev_script != expected_script {
-            return Err(Error::ScriptMismatch);
-        }
-        let sig_script = sign_p2pkh_input_cached(
-            secp,
-            &tx,
-            idx,
-            &expected_script,
-            &key.secret,
-            &pubkey,
-            &prefix_hash,
-        )?;
+        // sign_p2pkh_input_cached derives the pubkey from the key it signs with
+        // and refuses unless prev_script is that pubkey's P2PKH script, so the
+        // ScriptMismatch tripwire and the secret/pubkey binding are both enforced
+        // there, in one point multiplication.
+        let sig_script =
+            sign_p2pkh_input_cached(secp, &tx, idx, &meta.prev_script, &key.secret, &prefix_hash)?;
         tx.tx_in[idx].signature_script = sig_script;
     }
 
