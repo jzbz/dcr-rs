@@ -14,8 +14,35 @@
 //!   * SD  → write the same bytes as `unsigned.dcrtx` / `signed.dcrtx`.
 //!
 //! The format is shared with the KeyOS and Keystone Decred signers, so one
-//! companion implementation serves every device. This is format version 1;
+//! companion implementation serves every device. This is format version 2;
 //! bump [`FORMAT_VERSION`] on any breaking change.
+//!
+//! # Why version 2 exists
+//!
+//! Decred's signature hash does not commit to input amounts (see
+//! [`crate::sighash`]). In a version 1 package the only source for an input's
+//! value is [`InputMeta::value_in`], which the companion simply asserts. A
+//! hostile companion can therefore understate `value_in`, so the device shows a
+//! small fee, and dcrd's mempool then *rewrites* the value from the utxo set
+//! before computing the real fee (`internal/mempool/mempool.go`), paying the
+//! difference to the miner. No device-side check on version 1 data can detect
+//! this, because every number involved comes from the same untrusted source.
+//!
+//! Version 2 closes it by carrying the funding transaction for each input
+//! ([`InputMeta::prev_tx`]) so the device can verify `value_in` and
+//! `prev_script` against a hash it computes itself, and by carrying the
+//! derivation path of change outputs ([`OutputMeta::branch`] /
+//! [`OutputMeta::index`]) so ownership is proven rather than guessed by an
+//! address scan.
+//!
+//! Version 1 packages are REFUSED outright. Accepting them would defeat the
+//! purpose: the sender chooses the version, so a hostile companion would simply
+//! send version 1 to reach the unverifiable path, leaving the amount attack
+//! fully exploitable behind a warning the user has to notice. Verification is
+//! worth only as much as the refusal of unverified packages.
+//!
+//! Nothing is lost by refusing: version 1 shipped with no companion that emits
+//! it, so there are no such packages in circulation.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -23,22 +50,31 @@ use alloc::vec::Vec;
 use minicbor::{Decode, Encode};
 use secp256k1::{All, Secp256k1};
 
-use crate::address::{p2pkh_hash160, p2pkh_script, Address};
+use crate::address::{p2pkh_script, Address};
 use crate::hashing::hash160;
 use crate::hd::{ExtPrivKey, ExtPubKey, BRANCH_EXTERNAL, BRANCH_INTERNAL};
 use crate::sign::sign_p2pkh_input;
 use crate::tx::{MsgTx, OutPoint, TxIn, TxOut, NULL_BLOCK_HEIGHT, NULL_BLOCK_INDEX};
 use crate::Error;
 
-/// Version of the CBOR package layout this build speaks.
-pub const FORMAT_VERSION: u8 = 1;
+/// Version of the CBOR package layout. This is the ONLY version accepted; see
+/// the module docs for why accepting version 1 would reopen the amount attack.
+pub const FORMAT_VERSION: u8 = 2;
 
-/// How many indices past the highest input index we scan per branch when
-/// deciding whether an output pays one of our own keys.
-const OWNERSHIP_GAP: u32 = 20;
-/// Hard bound on the ownership scan so a hostile package cannot make the
-/// device grind through thousands of EC derivations.
-const OWNERSHIP_SCAN_MAX: u32 = 1000;
+/// Fees at or below this are always allowed regardless of proportion, so that
+/// dust consolidation — where the fee is legitimately a large share of a small
+/// total — still works. 0.001 DCR.
+pub const FEE_ALWAYS_ALLOWED_ATOMS: i64 = 100_000;
+
+/// Above [`FEE_ALWAYS_ALLOWED_ATOMS`], refuse a fee exceeding `1 / N` of the
+/// declared input total. Catches a companion that asks the user to approve an
+/// openly absurd fee.
+///
+/// This is NOT a defence against the version 1 amount-understatement described
+/// in the module docs: there the declared fee is small and only becomes large
+/// after dcrd substitutes the true input values. Only version 2's `prev_tx`
+/// verification addresses that.
+pub const MAX_FEE_FRACTION_DIVISOR: i64 = 20;
 
 /// One input to be signed, with the metadata only an online wallet has.
 #[derive(Clone, Debug, Encode, Decode)]
@@ -69,6 +105,22 @@ pub struct InputMeta {
     /// equals `p2pkh(hash160(pubkey))` before trusting it.
     #[n(7)]
     pub prev_script: Vec<u8>,
+    /// REQUIRED: the serialized funding transaction that created this input's
+    /// prevout.
+    ///
+    /// This is what makes [`InputMeta::value_in`] verifiable. The device computes
+    /// `blake256(prefix)` over these bytes and requires it to equal
+    /// [`InputMeta::prev_hash`], then requires the referenced output's value and
+    /// script to equal `value_in` and `prev_script`. Without it the amounts are
+    /// unverifiable assertions — see the module docs.
+    ///
+    /// Typed `Option` only for wire mechanics and diagnostics, never as licence to
+    /// omit it: minicbor omits a trailing `None`, and keeping the field optional
+    /// lets a package that leaves it out fail in [`SignRequest::validate`] with a
+    /// specific "input without prev_tx" error rather than an opaque CBOR decode
+    /// failure. `validate` rejects `None` unconditionally.
+    #[n(8)]
+    pub prev_tx: Option<Vec<u8>>,
 }
 
 /// One output, for both the wire tx and on-device display.
@@ -83,10 +135,27 @@ pub struct OutputMeta {
     /// The public key script.
     #[n(2)]
     pub pk_script: Vec<u8>,
-    /// True if this output is change back to our own wallet — advisory only;
-    /// the device re-derives ownership itself (see [`SignRequest::review_owned`]).
+    /// True if this output is change back to our own wallet. Advisory on its own —
+    /// the device proves ownership itself (see [`SignRequest::review_owned`]).
+    ///
+    /// Must agree with the presence of [`OutputMeta::branch`]: a change output
+    /// carries its path, a recipient does not. A package where the two disagree is
+    /// malformed and refused, which is what removes the old ambiguity between
+    /// "provably not ours" and "not found inside the scan window".
     #[n(3)]
     pub is_change: bool,
+    /// REQUIRED at format version 2 for change outputs, absent otherwise: the
+    /// branch of the key that owns this output.
+    ///
+    /// Lets the device prove ownership with one derivation instead of scanning a
+    /// window of addresses guessed from the input indices. That scan is what
+    /// misclassified change beyond the window as an external recipient.
+    #[n(4)]
+    pub branch: Option<u32>,
+    /// Address index below [`OutputMeta::branch`]. Present exactly when
+    /// `branch` is.
+    #[n(5)]
+    pub index: Option<u32>,
 }
 
 /// The unsigned-transaction package a companion hands the signer.
@@ -132,6 +201,10 @@ pub fn encode_sign_request(req: &SignRequest) -> Result<Vec<u8>, Error> {
 }
 
 /// Decode a sign request, enforcing the format version gate.
+///
+/// Only [`FORMAT_VERSION`] is accepted. Version 1 packages are refused here
+/// rather than downgraded to an unverified path, because the sender picks the
+/// version and would otherwise choose the weaker one.
 pub fn decode_sign_request(bytes: &[u8]) -> Result<SignRequest, Error> {
     let req: SignRequest = minicbor::decode(bytes).map_err(|_| Error::Parse)?;
     if req.format_version != FORMAT_VERSION {
@@ -152,12 +225,15 @@ pub struct ReviewSummary {
     pub output_total: i64,
     /// `input_total - output_total`.
     pub fee: i64,
-    /// Outputs the companion claimed were change (`is_change = true`) but that
-    /// the device CANNOT derive as its own. A correct watch-only wallet never
-    /// does this, so each entry is evidence the companion is faulty or hostile
-    /// — these MUST be surfaced loudly and block reflexive approval.
-    pub flagged_mismatches: Vec<(String, i64)>,
 }
+// NOTE: `flagged_mismatches` was removed with the address scan. It reported
+// outputs the companion called change that the scan could not derive — a
+// condition that no longer exists. An output is change only if a supplied path
+// derives to its script, `validate` requires `is_change` to agree with that
+// path's presence, and a path that fails to derive is a hard
+// [`Error::ScriptMismatch`] rather than something to display. There is nothing
+// left to warn about, so a device should drop the corresponding warning block
+// instead of rendering a list that can never be non-empty.
 
 /// Largest legal Decred amount (dcrd `dcrutil.MaxAmount`): 21M DCR in atoms.
 /// Anything above this in a package is hostile or corrupt.
@@ -190,11 +266,47 @@ impl SignRequest {
         total_atoms(self.outputs.iter().map(|o| &o.value))
     }
 
-    fn scan_window(&self) -> u32 {
-        let max_index = self.inputs.iter().map(|i| i.index).max().unwrap_or(0);
-        max_index
-            .saturating_add(OWNERSHIP_GAP)
-            .min(OWNERSHIP_SCAN_MAX)
+    /// Verify every input's declared amount and script against the funding
+    /// transaction supplied alongside it. This is the check that makes a fee
+    /// figure trustworthy; see the module docs for why version 1 cannot have one.
+    ///
+    /// For each input: the funding transaction is parsed, its txid recomputed as
+    /// `blake256` over the prefix serialization (Decred's txid is a *single*
+    /// BLAKE-256, not a double hash), and required to equal `prev_hash`. The
+    /// referenced output must then exist and carry exactly the declared
+    /// `value_in` and `prev_script`. A mismatch anywhere means the companion lied
+    /// about what is being spent.
+    ///
+    /// Needs no key material, so a caller may run it before asking for a
+    /// password.
+    pub fn verify_prev_txs(&self) -> Result<(), Error> {
+        for meta in &self.inputs {
+            let raw = meta.prev_tx.as_ref().ok_or(Error::InvalidRequest(
+                "format version 2 input without prev_tx",
+            ))?;
+            let funding =
+                MsgTx::parse_full(raw).map_err(|_| Error::InvalidRequest("unparseable prev_tx"))?;
+            if funding.tx_hash() != meta.prev_hash {
+                return Err(Error::InvalidRequest(
+                    "prev_tx does not hash to the declared prevout",
+                ));
+            }
+            let out = funding
+                .tx_out
+                .get(meta.prev_index as usize)
+                .ok_or(Error::InvalidRequest("prev_index past end of prev_tx"))?;
+            if out.value != meta.value_in {
+                return Err(Error::InvalidRequest(
+                    "declared input amount does not match the funding output",
+                ));
+            }
+            if out.pk_script != meta.prev_script {
+                return Err(Error::InvalidRequest(
+                    "declared input script does not match the funding output",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Structural + economic sanity, needing no key material. REFUSES packages
@@ -212,12 +324,37 @@ impl SignRequest {
         if self.inputs.len() > MAX_INPUTS || self.outputs.len() > MAX_OUTPUTS {
             return Err(Error::InvalidRequest("too many inputs or outputs"));
         }
+        // Only version 1 transactions are standard on Decred, and DCP0008 caps
+        // the version at 3 in consensus. Anything else assembles into a tx the
+        // network will not mine, with nothing on screen to explain why.
+        if self.tx_version != 1 {
+            return Err(Error::InvalidRequest("unsupported transaction version"));
+        }
         for i in &self.inputs {
             if i.value_in <= 0 {
                 return Err(Error::InvalidRequest("non-positive input amount"));
             }
             if i.value_in > MAX_ATOMS {
                 return Err(Error::InvalidRequest("input amount exceeds max supply"));
+            }
+            // These three were previously enforced only in check_owned_inputs and
+            // in sign_request, leaving the display path free to derive and show an
+            // address from a path this wallet never uses, and free to be driven
+            // into a maxed-out ownership scan by a huge index. Enforcing them here
+            // covers every entry point, since they all call validate() first.
+            if i.branch != BRANCH_EXTERNAL && i.branch != BRANCH_INTERNAL {
+                return Err(Error::InvalidRequest("unknown derivation branch"));
+            }
+            if i.index >= crate::hd::HARDENED {
+                return Err(Error::InvalidRequest("hardened address index"));
+            }
+            if i.tree != 0 {
+                return Err(Error::InvalidRequest(
+                    "only regular-tree outputs can be spent",
+                ));
+            }
+            if i.prev_tx.is_none() {
+                return Err(Error::InvalidRequest("input without prev_tx"));
             }
         }
         for o in &self.outputs {
@@ -226,6 +363,35 @@ impl SignRequest {
             }
             if o.value > MAX_ATOMS {
                 return Err(Error::InvalidRequest("output amount exceeds max supply"));
+            }
+            // Every standard Decred script is version 0. A higher version is
+            // consensus-invalid under DCP0008 (ErrScriptVersionTooHigh), but it is
+            // copied verbatim into the signed tx and ignored by address
+            // classification, so without this check the device happily signs a
+            // transaction that can never confirm.
+            if o.version != 0 {
+                return Err(Error::InvalidRequest("unsupported output script version"));
+            }
+            // A change output carries its path; a recipient does not. Requiring the
+            // two to agree is what lets an ownership disagreement be a hard error
+            // instead of the inconclusive flag the old address scan produced.
+            if o.branch.is_some() != o.index.is_some() {
+                return Err(Error::InvalidRequest(
+                    "output branch and index must both be present or both absent",
+                ));
+            }
+            if o.is_change != o.branch.is_some() {
+                return Err(Error::InvalidRequest(
+                    "change output must carry its derivation path",
+                ));
+            }
+            if let (Some(branch), Some(index)) = (o.branch, o.index) {
+                if branch != BRANCH_EXTERNAL && branch != BRANCH_INTERNAL {
+                    return Err(Error::InvalidRequest("unknown output derivation branch"));
+                }
+                if index >= crate::hd::HARDENED {
+                    return Err(Error::InvalidRequest("hardened output address index"));
+                }
             }
         }
         // Exact i128 sums: hostile i64 values cannot wrap the totals (and the
@@ -240,6 +406,16 @@ impl SignRequest {
                 "outputs exceed inputs (negative fee)",
             ));
         }
+        // Refuse an openly absurd fee. Now that prev_tx pins every input amount,
+        // this operates on verified numbers rather than companion assertions, so it
+        // is a real bound on what a mistaken or hostile companion can spend on
+        // fees, not just a sanity check.
+        let fee = input_total - output_total;
+        if fee > FEE_ALWAYS_ALLOWED_ATOMS as i128
+            && fee * MAX_FEE_FRACTION_DIVISOR as i128 > input_total
+        {
+            return Err(Error::InvalidRequest("fee is implausibly large"));
+        }
         // The same coin listed twice inflates the apparent input total and
         // understates the fee shown for review. O(n²) is fine under MAX_INPUTS.
         for (a, i) in self.inputs.iter().enumerate() {
@@ -249,55 +425,47 @@ impl SignRequest {
                 }
             }
         }
-        Ok(())
+        // Verify the amounts against the funding transactions, LAST so that the
+        // cheap structural checks above reject a hostile package before any parsing
+        // or hashing work.
+        //
+        // This lives inside validate() deliberately, rather than being left for
+        // callers to remember. Every entry point — the display path, the ownership
+        // check, and the signer — already calls validate() first, so putting it
+        // here means none of them can present or sign an unverified amount. A
+        // verification that callers must opt into is one a caller will eventually
+        // skip, and the display path skipping it would be just as damaging as the
+        // signer doing so: the user would be approving numbers nobody checked.
+        self.verify_prev_txs()
     }
 
-    /// Trustless review: instead of believing the companion's `is_change`
-    /// flag, the device RE-DERIVES its own addresses (public CKD below the
-    /// account-level key) and decides for itself which outputs are change
-    /// (pay one of our keys) and which are external recipients. This mirrors
-    /// the input-side `prev_script` verification in
-    /// [`SignRequest::check_owned_inputs`], so a malicious or buggy companion
-    /// cannot hide a destination by mislabelling it as change.
+    /// Trustless review: an output counts as change only when the device can
+    /// PROVE it owns it, by deriving the key at the path the companion supplied
+    /// and requiring it to produce exactly this output's script. Everything else
+    /// is an external recipient and lands in the headline amount.
+    ///
+    /// This replaces the address scan earlier versions used. That scan derived a
+    /// window of addresses guessed from the highest *input* index and applied it
+    /// to both branches — but the external and internal branches advance
+    /// independently, so change beyond the window was misfiled as a recipient and
+    /// simultaneously flagged as evidence of a hostile companion, against the
+    /// user's own address. Proving one path per output removes the guess, the
+    /// false accusation, and the thousands of EC derivations a large index could
+    /// provoke.
+    ///
+    /// The direction of failure is deliberately safe: a companion that omits the
+    /// path for an output that really is ours gets it displayed as a recipient,
+    /// over-stating what is being sent rather than hiding it. Claiming a path
+    /// that does not derive to the script is a hard error, so a recipient can
+    /// never be disguised as change.
+    ///
+    /// Call [`SignRequest::validate`] first; it guarantees `is_change` agrees with
+    /// the presence of the path, so the two cannot disagree here.
     pub fn review_owned(
         &self,
         secp: &Secp256k1<All>,
         account: &ExtPubKey,
     ) -> Result<ReviewSummary, Error> {
-        // Extract the P2PKH hash160 of every output up front (non-P2PKH can
-        // never be one of our keys), then scan our own keys (external + change
-        // branches; the window tracks the wallet's usage level via the highest
-        // input index) comparing against those few hashes as each key is
-        // derived. Memory stays O(outputs) instead of materializing the whole
-        // ownership set — up to ~40 KB at the scan cap, which matters on
-        // hardware wallets — and the scan stops early once every candidate
-        // output is already known to be ours.
-        let out_hashes: Vec<Option<[u8; 20]>> = self
-            .outputs
-            .iter()
-            .map(|o| p2pkh_hash160(&o.pk_script))
-            .collect();
-        let mut owned_out = alloc::vec![false; self.outputs.len()];
-        let mut unresolved = out_hashes.iter().filter(|h| h.is_some()).count();
-
-        let window = self.scan_window();
-        'scan: for branch in [BRANCH_EXTERNAL, BRANCH_INTERNAL] {
-            let branch_key = account.derive_child(secp, branch)?;
-            for index in 0..=window {
-                if unresolved == 0 {
-                    break 'scan;
-                }
-                let key = branch_key.derive_child(secp, index)?;
-                let h = hash160(&key.compressed_pubkey());
-                for (i, oh) in out_hashes.iter().enumerate() {
-                    if !owned_out[i] && *oh == Some(h) {
-                        owned_out[i] = true;
-                        unresolved -= 1;
-                    }
-                }
-            }
-        }
-
         let display = |script: &[u8]| -> String {
             Address::from_script(script, account.network)
                 .map(|a| a.encode())
@@ -306,15 +474,21 @@ impl SignRequest {
 
         let mut recipients = Vec::new();
         let mut change = Vec::new();
-        let mut flagged_mismatches = Vec::new();
-        for (i, o) in self.outputs.iter().enumerate() {
+        for o in &self.outputs {
             let addr = display(&o.pk_script);
-            if owned_out[i] {
-                change.push((addr, o.value));
-            } else {
-                recipients.push((addr.clone(), o.value));
-                if o.is_change {
-                    flagged_mismatches.push((addr, o.value));
+            match (o.branch, o.index) {
+                (Some(branch), Some(index)) => {
+                    // Prove it: derive that exact key and require the output's script
+                    // to be its P2PKH script. Anything else means the companion
+                    // labelled someone else's output as our change.
+                    let pubkey = account.pubkey_at(secp, branch, index)?;
+                    if o.pk_script != p2pkh_script(&hash160(&pubkey)) {
+                        return Err(Error::ScriptMismatch);
+                    }
+                    change.push((addr, o.value));
+                }
+                _ => {
+                    recipients.push((addr, o.value));
                 }
             }
         }
@@ -327,7 +501,6 @@ impl SignRequest {
             input_total,
             output_total,
             fee: input_total - output_total,
-            flagged_mismatches,
         })
     }
 
