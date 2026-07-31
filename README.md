@@ -34,8 +34,17 @@ dcrd's `hdkeychain` strips leading zero bytes from a child private key before
 feeding it into the next hardened HMAC, and dcrwallet and decrediton use that
 variant for the whole wallet path. So for a parent key with a leading zero byte
 the hardened HMAC input is `0x00 ‖ key31 ‖ 0x00 ‖ ser32(i)` where BIP32 says
-`0x00 ‖ 0x00 ‖ key31 ‖ ser32(i)`, and every descendant diverges. The account key
-at `m/44'/42'/0'` differs between the two variants for roughly **1 seed in 112**.
+`0x00 ‖ 0x00 ‖ key31 ‖ ser32(i)`, and every descendant diverges. Measured
+against the local dcrd `hdkeychain` over 200 000 seeds, the account key at
+`m/44'/42'/0'` differs between the two variants for **1 seed in 130**.
+
+Stripping is a property of the STORED key rather than of the derivation being
+performed — in dcrd it is `[]byte` length, and only `child()` ever strips, only
+the key it has just produced. So the master is never stripped; a key reparsed
+from its `dprv` is never stripped, because serialization zero-pads, and a round
+trip therefore changes that key's hardened children; and `strictBIP32` decides
+how the CHILD is stored, while the preimage layout comes from how the PARENT
+already was.
 
 This crate mirrors dcrd's own API:
 

@@ -24,9 +24,34 @@
 //!
 //! So for a parent private key with a leading zero byte the hardened HMAC input
 //! is `0x00 ‖ key31 ‖ 0x00 ‖ ser32(i)` rather than BIP32's
-//! `0x00 ‖ 0x00 ‖ key31 ‖ ser32(i)`, and every descendant diverges. Measured over
-//! 20 000 seeds, the account key at `m/44'/42'/0'` differs between the two
-//! variants for about 1 seed in 112.
+//! `0x00 ‖ 0x00 ‖ key31 ‖ ser32(i)`, and every descendant diverges. Measured
+//! against the local dcrd `hdkeychain` over 200 000 seeds, the account key at
+//! `m/44'/42'/0'` differs between the two variants for 1 seed in 130 — which is
+//! the `1 - (255/256)²` the path implies, since exactly two of its three
+//! hardened parents can be stripped (see below).
+//!
+//! ## Which keys are stripped
+//!
+//! Stripping is a property of the STORED key, not of the derivation being
+//! performed. In dcrd it is literally `[]byte` length: only `child()` strips,
+//! and only the key it has just produced, so
+//!
+//! * the master is never stripped — `NewMaster` stores the full 32 HMAC bytes;
+//! * a key from `NewKeyFromString` is never stripped — a serialized extended
+//!   key is zero-padded to 32 bytes, so a round trip restores the padded form
+//!   and CHANGES that key's hardened children;
+//! * `strictBIP32` decides whether the CHILD is stored stripped; the preimage
+//!   layout comes from how the PARENT already was. A strict child of a stripped
+//!   parent therefore still sees the short form.
+//!
+//! A [`secp256k1::SecretKey`] is always 32 zero-padded bytes, so this crate has
+//! to carry that provenance explicitly rather than recover it from the key. An
+//! earlier version stripped at use time unconditionally, which also stripped the
+//! master: for the ~1 seed in 256 whose master private key begins with a zero
+//! byte that produced an account key NEITHER `Child` nor `ChildBIP32Std`
+//! reproduces. `tests/vectors.rs` pins the master case, a mixed-variant path and
+//! the round-trip, none of which the pure-legacy and pure-strict vectors could
+//! discriminate.
 //!
 //! dcrd exposes both (`Child` legacy, `ChildBIP32Std` strict) and dcrwallet uses
 //! the legacy one for the entire wallet path, so this crate mirrors that:
@@ -86,6 +111,29 @@ pub struct ExtPrivKey {
     pub parent_fingerprint: [u8; 4],
     /// Child index this key was derived at (0 for the master).
     pub child_number: u32,
+    /// Whether this key's dcrd-equivalent STORED form has had its leading zero
+    /// bytes removed — which decides the byte layout of the HMAC preimage when
+    /// this key is used as a hardened parent.
+    ///
+    /// In dcrd this is not a flag but a consequence of `[]byte` length. Only
+    /// `child()` strips, and only the key it just produced
+    /// (`hdkeychain/extendedkey.go`, the `for !strictBIP32 && childKey[0] == 0`
+    /// loop); `NewMaster` stores the full 32 bytes from HMAC and
+    /// `NewKeyFromString` the full 32 from the serialization, and
+    /// `newExtendedKey` never normalizes. `child()` then lays the parent out
+    /// with `copy(data[1:], k.key)`, so a 31-byte stored key lands
+    /// left-aligned and a 32-byte one does not.
+    ///
+    /// A [`SecretKey`] is always 32 zero-padded bytes, so that length — the
+    /// entire mechanism — is not recoverable from the key itself and has to be
+    /// carried alongside it. Stripping at use time without it strips the MASTER
+    /// too, which dcrd never does: for the ~1 seed in 256 whose master private
+    /// key begins with a zero byte, that produces an account key no dcrd API
+    /// reproduces, under either `Child` or `ChildBIP32Std`.
+    ///
+    /// Private (not `pub`) deliberately: set wrongly it silently relocates an
+    /// entire wallet, so only this module's constructors ever set it.
+    zeros_stripped: bool,
 }
 
 /// Scrub private material when an `ExtPrivKey` (master or any derived child)
@@ -122,6 +170,10 @@ impl ExtPrivKey {
             depth: 0,
             parent_fingerprint: [0; 4],
             child_number: 0,
+            // dcrd `NewMaster` hands the full 32 HMAC bytes to `newExtendedKey`
+            // and nothing strips them, so a master whose key begins with a zero
+            // byte keeps it and derives its hardened children BIP32-style.
+            zeros_stripped: false,
         })
     }
 
@@ -213,10 +265,16 @@ impl ExtPrivKey {
             //
             // Same length, different bytes — hence a different child.
             let mut key = self.secret.secret_bytes();
-            let skip = if strict_bip32 {
-                0
-            } else {
+            // The layout is decided by how THIS key is stored, not by the
+            // variant being derived now: dcrd's `child` copies `k.key` in
+            // whatever length it already has, and its `strictBIP32` argument
+            // only governs whether the CHILD it returns is stored stripped.
+            // So `ChildBIP32Std` on a stripped parent still sees the short
+            // form, and `Child` on the master still sees the full 32 bytes.
+            let skip = if self.zeros_stripped {
                 key.iter().take_while(|&&b| b == 0).count()
+            } else {
+                0
             };
             let mut data = [0u8; 37];
             data[1..1 + (32 - skip)].copy_from_slice(&key[skip..]);
@@ -250,6 +308,9 @@ impl ExtPrivKey {
             depth,
             parent_fingerprint: [h[0], h[1], h[2], h[3]],
             child_number: index,
+            // dcrd strips the key it just produced only on the legacy path, so
+            // that is exactly when the child's stored form is the short one.
+            zeros_stripped: !strict_bip32,
         })
     }
 
@@ -356,6 +417,12 @@ impl ExtPrivKey {
                 depth: raw.depth,
                 parent_fingerprint: raw.parent_fingerprint,
                 child_number: raw.child_number,
+                // An extended key serializes zero-padded to 32 bytes, and dcrd
+                // `NewKeyFromString` stores exactly those bytes — so a key that
+                // was stored stripped comes back unstripped, and its hardened
+                // children change accordingly. Faithful to dcrd, surprising as
+                // it is: serializing and reparsing is not derivation-neutral.
+                zeros_stripped: false,
             })
         })();
         // The decoded key-data slot held the raw secret; wipe it either way.
