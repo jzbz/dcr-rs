@@ -12,7 +12,9 @@ edition = "2021"
 # Set by the dependency floor, not by this crate's own source: zeroize 1.9 and
 # zeroize_derive 1.5 declare 1.85. Embedded targets often sit on a pinned
 # toolchain, so state it rather than letting the failure surface from inside a
-# dependency. Lowering it means capping `zeroize` at 1.8.
+# dependency. Lowering it means capping `zeroize` at 1.8. CI's msrv job builds
+# the whole feature matrix and the bare-metal target against it, so the number
+# is checked rather than merely declared.
 rust-version = "1.85"
 description = "Decred (DCR) primitives: BLAKE-256, addresses, HD keys, transaction wire format, and SigHashAll signing"
 license = "ISC"
