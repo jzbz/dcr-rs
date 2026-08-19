@@ -29,6 +29,18 @@ pub const NULL_BLOCK_INDEX: u32 = 0xffff_ffff;
 /// Sentinel for "unknown" witness input value (dcrd `wire.NullValueIn`).
 pub const NULL_VALUE_IN: i64 = -1;
 
+/// Largest input sequence number (dcrd `wire.MaxTxInSequenceNum`), which
+/// ordinary sends carry on every input.
+///
+/// Finality is a property of the whole transaction, not of one input. dcrd's
+/// `IsFinalizedTransaction` (`internal/blockchain/validate.go`) calls a
+/// transaction final when its lock time is zero or already passed, and
+/// otherwise only when EVERY input carries exactly this value; a transaction
+/// that is not finalized is non-standard, so the mempool will not relay it. One
+/// input a single unit below this is therefore enough to hold a whole
+/// transaction back until its lock time arrives.
+pub const MAX_TX_IN_SEQUENCE: u32 = 0xffff_ffff;
+
 /// Cap on the element count a parser pre-allocates for. `read_count` already
 /// bounds a hostile count by the bytes left in the buffer, but the per-element
 /// struct is wider than its minimum wire size (a `TxOut` is ~40 bytes for an

@@ -144,6 +144,56 @@ fn bip32_priv_pub_prefix_mixups_rejected() {
     );
 }
 
+/// dcrd `NewKeyFromString` checks the version only against the network's *pair*
+/// of magic values and then reads the key type off the key data
+/// (`isPrivate = keyData[0] == 0x00`), so over there the prefix a user reads
+/// guarantees nothing about what they got: the two strings below are the
+/// vector-1 master with the versions swapped and the checksum recomputed, and
+/// dcrd parses the `dprv…` as a PUBLIC key and the `dpub…` as a PRIVATE one.
+/// This crate ties type to version and rejects both, which costs nothing —
+/// dcrd's own `String()` picks the version from `isPrivate`, so nothing that
+/// serializes a key can emit either form.
+///
+/// Without this the `key_data[0] != 0` check in `ExtPrivKey::from_base58` could
+/// be deleted as redundant and every other test would still pass: the mixup
+/// test above dies at the version lookup and never reaches the type check.
+#[test]
+fn bip32_key_type_is_bound_to_the_version_prefix() {
+    const DPRV_VERSION_PUBLIC_DATA: &str = "dprv3hCznBesA6jBtmoyVFPfyMSZ1qYZ3WdjdebquvkEfmRfxC9VFEFi2YDaJunpNqAk9uXarwUGLKeeUPeN6krDBjtmffMSWatKjTRX5HYqP7B";
+    const DPUB_VERSION_PRIVATE_DATA: &str = "dpubZ9169KDAEUnyoBhjjmT2VaEodr6pUTDoqCEAeqgbfr2JfkB88BbK77jbTU6b7pKYjhYAcpHQXWnEp4LGfS1qNwop3oPy8PjZWVyCpHYwiav";
+
+    // Both are well-formed base58check over an 82-byte body, so they reach the
+    // type check instead of dying at the checksum — what follows is about the
+    // type check and nothing else. (`check_decode` is the address helper, so it
+    // splits 2 bytes of the version word off the 78-byte body: 76 remain.)
+    for s in [DPRV_VERSION_PUBLIC_DATA, DPUB_VERSION_PRIVATE_DATA] {
+        assert_eq!(dcr_rs::hashing::check_decode(s).unwrap().1.len(), 76, "{s}");
+    }
+
+    // A dprv carrying public key data. Drop the type check and the trailing 32
+    // bytes — the compressed pubkey's X coordinate, itself a valid scalar —
+    // parse as the secret and this reads Ok, so the assertion is not vacuous.
+    assert_eq!(
+        ExtPrivKey::from_base58(DPRV_VERSION_PUBLIC_DATA).err(),
+        Some(Error::Parse)
+    );
+    assert_eq!(
+        ExtPubKey::from_base58(DPRV_VERSION_PUBLIC_DATA),
+        Err(Error::UnknownPrefix)
+    );
+
+    // A dpub carrying private key data — the direction that matters more, since
+    // to dcrd this string is a private key wearing a watch-only prefix.
+    assert_eq!(
+        ExtPubKey::from_base58(DPUB_VERSION_PRIVATE_DATA),
+        Err(Error::Parse)
+    );
+    assert_eq!(
+        ExtPrivKey::from_base58(DPUB_VERSION_PRIVATE_DATA).err(),
+        Some(Error::UnknownPrefix)
+    );
+}
+
 #[test]
 fn bip32_testnet_simnet_version_bytes() {
     // Same key material, other networks: the serialized string must start with

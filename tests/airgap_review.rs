@@ -720,6 +720,39 @@ mod fp_compat {
             Err(Error::UnsupportedVersion)
         ));
     }
+
+    /// A device must not accept bytes it never looked at. `minicbor::decode`
+    /// stops at the end of the top-level item, so without the position check in
+    /// `decode_sign_request` every case below decodes as if the suffix were not
+    /// there.
+    #[test]
+    fn refuses_trailing_bytes_after_the_package() {
+        let bytes = encode_sign_request(&with_fp(None)).unwrap();
+        decode_sign_request(&bytes).expect("the unpadded package decodes");
+
+        // A second CBOR item (a transport concatenation bug) and dead padding
+        // (a caller passing its whole scratch buffer) are the two real shapes.
+        for suffix in [&[0xf6u8][..], &[0x00, 0x00, 0x00][..]] {
+            let mut padded = bytes.clone();
+            padded.extend_from_slice(suffix);
+            assert!(matches!(
+                decode_sign_request(&padded),
+                Err(Error::InvalidRequest("trailing bytes after package"))
+            ));
+        }
+
+        // What the check must NOT break: an unknown element INSIDE the array
+        // still decodes, which is the forward compatibility `account_fp` relies
+        // on. Splice the 8-element header to 9 and append the extra element.
+        let mut longer = encode_sign_request(&with_fp(Some([1, 2, 3, 4]))).unwrap();
+        assert_eq!(longer[0], 0x88);
+        longer[0] = 0x89;
+        longer.push(0xf6);
+        assert_eq!(
+            decode_sign_request(&longer).unwrap().account_fp,
+            Some([1, 2, 3, 4])
+        );
+    }
 }
 
 #[test]
@@ -1126,6 +1159,77 @@ fn review_owned_proves_input_ownership() {
         Err(Error::ScriptMismatch)
     ));
     assert_eq!(sign_request(&secp, &m, &req), Err(Error::ScriptMismatch));
+}
+
+/// The summary must report the transaction's timing fields, because they are
+/// signed verbatim and no amount on the screen reveals them.
+///
+/// A companion can hand over a send whose addresses and amounts review as
+/// completely ordinary while its lock time sits far above the current chain
+/// height. dcrd calls such a transaction non-final and will not relay it, so the
+/// send simply does not happen — nothing is stolen, but a review screen that
+/// cannot say so is describing a transaction other than the one being signed.
+///
+/// The lowered sequence is on the SECOND input on purpose: finality is a property
+/// of every input at once, so a check that looked only at the first would call
+/// this transaction final.
+#[test]
+fn review_owned_reports_lock_time_expiry_and_nonfinal_sequence() {
+    let secp = Secp256k1::new();
+    let m = master();
+    let acct = m.account_key(&secp, 0).unwrap();
+    let account = account_pub(&secp, &m);
+    let key0 = acct.address_key(&secp, BRANCH_EXTERNAL, 0).unwrap();
+    let script0 = p2pkh_script(&hash160(&key0.compressed_pubkey(&secp))).to_vec();
+
+    // Two of our own inputs from one funding transaction, 100_000 each, 190_000
+    // to a stranger: an entirely ordinary send.
+    let (prev_hash, prev_prefix) = funding_two_outputs(100_000, &script0);
+    let mut plain = basic_request(script0, vec![recipient(190_000, foreign_script(0xee))]);
+    plain.inputs[0].prev_hash = prev_hash;
+    plain.inputs[0].prev_tx_prefix = Some(prev_prefix);
+    let mut second = plain.inputs[0].clone();
+    second.prev_index = 1;
+    plain.inputs.push(second);
+
+    let plain_summary = plain.review_owned(&secp, &account).unwrap();
+    assert_eq!(plain_summary.lock_time, 0);
+    assert_eq!(plain_summary.expiry, 0);
+    assert!(
+        !plain_summary.has_nonfinal_sequence,
+        "every input sits at wire.MaxTxInSequenceNum"
+    );
+
+    // The same addresses and the same amounts, delayed: a lock time far above any
+    // plausible current height, armed by one input dropped below the maximum.
+    let mut delayed = plain.clone();
+    delayed.lock_time = 9_000_000;
+    delayed.expiry = 9_000_100;
+    delayed.inputs[1].sequence = 0xffff_fffe;
+
+    let summary = delayed.review_owned(&secp, &account).unwrap();
+    assert_eq!(
+        summary.recipients, plain_summary.recipients,
+        "everything the old summary showed is byte-for-byte identical"
+    );
+    assert_eq!(summary.fee, plain_summary.fee);
+    assert_eq!(summary.lock_time, 9_000_000);
+    assert_eq!(summary.expiry, 9_000_100);
+    assert!(
+        summary.has_nonfinal_sequence,
+        "one input below the maximum makes the whole transaction non-final"
+    );
+
+    // And the summary must describe the transaction that is actually SIGNED, not
+    // merely echo the request struct back.
+    let signed = sign_request(&secp, &m, &delayed).unwrap();
+    let tx = MsgTx::parse_full(&signed).unwrap();
+    assert_eq!(tx.lock_time, summary.lock_time);
+    assert_eq!(tx.expiry, summary.expiry);
+    assert_eq!(
+        tx.tx_in.iter().any(|i| i.sequence != 0xffff_ffff),
+        summary.has_nonfinal_sequence
+    );
 }
 
 /// `sign_p2pkh_input` derives the published pubkey from the signing key itself, so

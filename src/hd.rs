@@ -96,6 +96,35 @@ pub const BRANCH_EXTERNAL: u32 = 0;
 /// Change branch below the account key.
 pub const BRANCH_INTERNAL: u32 = 1;
 
+/// Parse the left half of a derivation HMAC into the tweak `parse256(Il)`,
+/// rejecting both of the values dcrd rejects.
+///
+/// dcrd tests `overflow || ilModN.IsZero()` once, ahead of the private/public
+/// split (`hdkeychain/extendedkey.go`, `child`), so a bad `Il` is
+/// `ErrInvalidChild` on either path. [`Scalar::from_be_bytes`] is only the
+/// `overflow` half of that: it rejects values at or above the curve order and
+/// accepts zero. Nor does libsecp256k1 object to a zero tweak —
+/// `eckey_privkey_tweak_add` fails only when the SUM is zero and
+/// `eckey_pubkey_tweak_add` only when it is the point at infinity — so without
+/// the second test `add_tweak`/`add_exp_tweak` SUCCEED and return a child
+/// carrying its parent's key verbatim, which no dcrd API can hand back. One
+/// helper for both call sites, so the private and public paths cannot drift the
+/// way dcrd's single pre-split check cannot.
+///
+/// The opposite edge is a deliberate divergence rather than an oversight: dcrd
+/// never checks the SUM, so `Il + parentKey ≡ 0 (mod n)` leaves it storing 32
+/// zero bytes — which the legacy stripping loop then reduces to an EMPTY key —
+/// or serializing the point at infinity on the public path. The `add_tweak` and
+/// `add_exp_tweak` calls at the two call sites refuse that instead. Matching
+/// dcrd there would mean manufacturing a degenerate key and calling it valid.
+fn child_tweak(il: [u8; 32]) -> Result<Scalar, Error> {
+    let tweak = Scalar::from_be_bytes(il).map_err(|_| Error::Derivation)?;
+    if tweak == Scalar::ZERO {
+        return Err(Error::Derivation);
+    }
+    Ok(tweak)
+}
+
 /// A BIP32 extended private key carrying its target [`Network`].
 #[derive(Clone)]
 pub struct ExtPrivKey {
@@ -106,6 +135,14 @@ pub struct ExtPrivKey {
     /// BIP32 chain code.
     pub chain_code: [u8; 32],
     /// Depth below the master (master = 0).
+    ///
+    /// dcrd holds this as a `uint16` but serializes `byte(k.depth % 256)`
+    /// (`hdkeychain/extendedkey.go`, `String`), so a key past 255 levels cannot
+    /// round-trip there. One byte plus a `checked_add` is the fail-closed
+    /// spelling of that same one-byte wire slot: the 256th step returns
+    /// [`Error::Derivation`] rather than a key whose serialization silently
+    /// carries the wrong depth. No key material rides on it either way — depth
+    /// enters neither an HMAC preimage nor a fingerprint.
     pub depth: u8,
     /// First 4 bytes of the parent key's hash160 (zero for the master).
     pub parent_fingerprint: [u8; 4],
@@ -137,10 +174,18 @@ pub struct ExtPrivKey {
 }
 
 /// Scrub private material when an `ExtPrivKey` (master or any derived child)
-/// is dropped. Every intermediate produced along a derivation path is erased
-/// as it goes out of scope, so seed-derived secrets never linger in freed
-/// memory. `non_secure_erase` zeroes the secp256k1 secret; `zeroize` does a
-/// volatile (non-elidable) wipe of the chain code.
+/// is dropped. Every intermediate produced along a derivation path is erased as
+/// it goes out of scope — [`ExtPrivKey::derive_path`] reassigns, and assignment
+/// drops the previous key — so seed-derived secrets never linger in freed
+/// memory.
+///
+/// Both wipes are volatile writes behind a barrier, so neither is elided.
+/// `non_secure_erase` fills the secp256k1 secret with 0x01 rather than zeros,
+/// because the all-zero scalar is not a valid key; `zeroize` zeroes the chain
+/// code. What neither reaches is a copy something else already made:
+/// [`SecretKey`] is `Copy` and `add_tweak` takes it by value, so a derivation
+/// leaves the parent secret in a callee frame this `Drop` never sees. It
+/// shrinks the window rather than closing it.
 impl Drop for ExtPrivKey {
     fn drop(&mut self) {
         use zeroize::Zeroize;
@@ -289,8 +334,7 @@ impl ExtPrivKey {
         }
         let mut i = mac.finalize().into_bytes();
 
-        let tweak = Scalar::from_be_bytes(<[u8; 32]>::try_from(&i[..32]).unwrap())
-            .map_err(|_| Error::Derivation)?;
+        let tweak = child_tweak(<[u8; 32]>::try_from(&i[..32]).unwrap())?;
         let secret = self.secret.add_tweak(&tweak);
 
         let mut chain_code = [0u8; 32];
@@ -402,10 +446,26 @@ impl ExtPrivKey {
 
     /// Parse an extended private key string, detecting the network from the
     /// version bytes.
+    ///
+    /// Deliberately narrower than dcrd `NewKeyFromString`, twice over. The
+    /// version prefix fixes the key TYPE here, where dcrd takes only the network
+    /// from it and reads the type off the key data — so a `dprv…` carrying
+    /// public key data, which dcrd parses as a public key, is rejected. And no
+    /// expected network is passed in, so where dcrd answers `ErrWrongNetwork`
+    /// for a foreign prefix this returns the key with its own [`Network`]: a
+    /// caller that accepts only one network has to compare the field itself.
     pub fn from_base58(s: &str) -> Result<Self, Error> {
         let mut raw = parse_ext_key(s)?;
         let result = (|| {
             let network = Network::from_hd_priv_id(raw.version).ok_or(Error::UnknownPrefix)?;
+            // Load-bearing, and not a duplicate of the `SecretKey::from_slice`
+            // below: bytes 1..33 of a compressed pubkey are its X coordinate,
+            // which is a valid scalar with overwhelming probability. Drop this
+            // and a public key parses as a private key whose secret is public
+            // knowledge. dcrd instead reads the type off the key data
+            // (`hdkeychain/extendedkey.go`, `NewKeyFromString`), which is why a
+            // `dpub…` can be a private key over there; `tests/vectors.rs` pins
+            // the two strings.
             if raw.key_data[0] != 0 {
                 return Err(Error::Parse);
             }
@@ -440,7 +500,7 @@ pub struct ExtPubKey {
     pub public_key: PublicKey,
     /// BIP32 chain code.
     pub chain_code: [u8; 32],
-    /// Depth below the master (master = 0).
+    /// Depth below the master (master = 0); bounded as [`ExtPrivKey::depth`] is.
     pub depth: u8,
     /// First 4 bytes of the parent key's hash160 (zero for the master).
     pub parent_fingerprint: [u8; 4],
@@ -472,8 +532,7 @@ impl ExtPubKey {
         mac.update(&index.to_be_bytes());
         let i = mac.finalize().into_bytes();
 
-        let tweak = Scalar::from_be_bytes(<[u8; 32]>::try_from(&i[..32]).unwrap())
-            .map_err(|_| Error::Derivation)?;
+        let tweak = child_tweak(<[u8; 32]>::try_from(&i[..32]).unwrap())?;
         let public_key = self
             .public_key
             .add_exp_tweak(secp, &tweak)
@@ -532,6 +591,11 @@ impl ExtPubKey {
 
     /// Parse an extended public key string, detecting the network from the
     /// version bytes.
+    ///
+    /// The mirror of [`ExtPrivKey::from_base58`], narrower than dcrd for the
+    /// same reason: `PublicKey::from_slice` refuses the 0x00-prefixed private
+    /// form, which dcrd accepts under a `dpub…` version and hands back as a
+    /// private key. As there, no expected network is passed in.
     pub fn from_base58(s: &str) -> Result<Self, Error> {
         let raw = parse_ext_key(s)?;
         let network = Network::from_hd_pub_id(raw.version).ok_or(Error::UnknownPrefix)?;
@@ -624,4 +688,47 @@ fn parse_ext_key(s: &str) -> Result<RawExtKey, Error> {
     })();
     raw.zeroize();
     key
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both halves of dcrd's `overflow || ilModN.IsZero()`. The zero case is
+    /// the one [`child_tweak`] adds: no HMAC input can reach it, so this is the
+    /// only place the guard can be exercised at all.
+    #[test]
+    fn invalid_hmac_left_halves_are_rejected() {
+        assert!(child_tweak([0u8; 32]).is_err());
+        assert!(child_tweak([0xffu8; 32]).is_err());
+    }
+
+    /// Why that guard has to exist: libsecp256k1 treats a zero tweak as a
+    /// perfectly good no-op on both paths, so without it the "child" would
+    /// carry its parent's key verbatim. Should a future secp256k1 start
+    /// refusing a zero tweak itself, this fails and the guard can be revisited.
+    #[test]
+    fn a_zero_tweak_would_return_the_parent_unchanged() {
+        let secp = Secp256k1::new();
+        let parent = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        assert_eq!(
+            parent.add_tweak(&Scalar::ZERO).unwrap().secret_bytes(),
+            parent.secret_bytes()
+        );
+        let parent_pub = PublicKey::from_secret_key(&secp, &parent);
+        assert_eq!(
+            parent_pub.add_exp_tweak(&secp, &Scalar::ZERO).unwrap(),
+            parent_pub
+        );
+    }
+
+    /// `non_secure_erase` fills with 0x01 rather than zeros, because the
+    /// all-zero scalar is not a valid key. Pinned so the [`Drop`] comment above
+    /// cannot go stale across a secp256k1 bump.
+    #[test]
+    fn secret_erasure_fills_with_ones() {
+        let mut secret = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        secret.non_secure_erase();
+        assert_eq!(secret.secret_bytes(), [0x01u8; 32]);
+    }
 }

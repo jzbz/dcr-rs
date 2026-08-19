@@ -186,10 +186,13 @@ cargo test --all-features
 
 ## Security notes
 
-- Private key material is zeroized on drop: `ExtPrivKey` secrets and chain
+- Private key material is overwritten on drop: `ExtPrivKey` secrets and chain
   codes (including every intermediate along a derivation path), BIP32 HMAC
   outputs, BIP39 mnemonics and seeds, and the buffers used to serialize and
-  parse `dprv` strings.
+  parse `dprv` strings. All are volatile writes behind a barrier; the
+  `ExtPrivKey` secret is filled with `0x01` rather than zeros, since the
+  all-zero scalar is not a valid key. None of it reaches a copy a by-value call
+  has already made — this shrinks the window, it does not close it.
 - `ExtPrivKey` deliberately implements neither `Debug` nor `Display`.
 - Signatures are RFC6979-deterministic and low-S normalized.
 - Seeds are bounds-checked (16–64 bytes, per BIP32/dcrd), airgap amounts are
@@ -205,7 +208,8 @@ cargo test --all-features
 - Untrusted input is bounded before work is done on it: base58 strings are
   length-gated ahead of the quadratic decode, CBOR packages are capped
   (`airgap::MAX_PACKAGE_BYTES`), and the tx parser rejects hostile
-  counts/lengths, non-canonical varints, and trailing bytes.
+  counts/lengths and non-canonical varints. Neither the tx parser nor the CBOR
+  package decoder accepts trailing bytes.
 - `#![forbid(unsafe_code)]`.
 
 **Build the consuming firmware with `overflow-checks = true`.** This crate uses

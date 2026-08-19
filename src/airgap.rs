@@ -91,7 +91,9 @@ use crate::hashing::hash160;
 use crate::hd::{ExtPrivKey, ExtPubKey, BRANCH_EXTERNAL, BRANCH_INTERNAL};
 use crate::sighash::prefix_hash_all;
 use crate::sign::sign_p2pkh_input_cached;
-use crate::tx::{MsgTx, OutPoint, TxIn, TxOut, NULL_BLOCK_HEIGHT, NULL_BLOCK_INDEX};
+use crate::tx::{
+    MsgTx, OutPoint, TxIn, TxOut, MAX_TX_IN_SEQUENCE, NULL_BLOCK_HEIGHT, NULL_BLOCK_INDEX,
+};
 use crate::Error;
 
 /// Version of the CBOR package layout. This is the ONLY version accepted; see
@@ -285,11 +287,29 @@ pub const MAX_PACKAGE_BYTES: usize = 512 * 1024;
 /// Only [`FORMAT_VERSION`] is accepted. Version 1 packages are refused here
 /// rather than downgraded to an unverified path, because the sender picks the
 /// version and would otherwise choose the weaker one.
+///
+/// `bytes` must be exactly the package: a caller that hands over a fixed-size
+/// or zero-padded scratch buffer rather than slicing to the length its transport
+/// reported gets `InvalidRequest("trailing bytes after package")`.
 pub fn decode_sign_request(bytes: &[u8]) -> Result<SignRequest, Error> {
     if bytes.len() > MAX_PACKAGE_BYTES {
         return Err(Error::InvalidRequest("package too large"));
     }
-    let req: SignRequest = minicbor::decode(bytes).map_err(|_| Error::Parse)?;
+    // `minicbor::decode` is `Decoder::new(b).decode()`, which returns as soon as
+    // the top-level item is complete and never compares its position to the
+    // input length — so anything appended to a valid package decodes fine. That
+    // is the same non-injectivity [`MsgTx::parse_full`] refuses, at the boundary
+    // where it matters most: a device must not accept bytes it never looked at.
+    //
+    // This constrains only what FOLLOWS the top-level array. Unknown *elements*
+    // inside it are still skipped, which is what lets a longer array from a
+    // future encoder decode against this build — the additive-field forward
+    // compatibility `account_fp` relies on.
+    let mut d = minicbor::Decoder::new(bytes);
+    let req: SignRequest = d.decode().map_err(|_| Error::Parse)?;
+    if d.position() != bytes.len() {
+        return Err(Error::InvalidRequest("trailing bytes after package"));
+    }
     if req.format_version != FORMAT_VERSION {
         return Err(Error::UnsupportedVersion);
     }
@@ -300,6 +320,11 @@ pub fn decode_sign_request(bytes: &[u8]) -> Result<SignRequest, Error> {
 ///
 /// Holds nothing secret — addresses and amounts that are about to go on a screen
 /// anyway — so it is `Debug`.
+///
+/// Deliberately not `#[non_exhaustive]`: every field is a property the device
+/// signs and a human is meant to see, so code that destructures this should stop
+/// compiling when a new one appears rather than quietly keep hiding it. The
+/// price is a breaking change each time one is added, which is the trade taken.
 #[derive(Clone, Debug)]
 pub struct ReviewSummary {
     /// (address, amount) for every output the device does NOT own.
@@ -312,6 +337,30 @@ pub struct ReviewSummary {
     pub output_total: i64,
     /// `input_total - output_total`.
     pub fee: i64,
+    /// [`SignRequest::lock_time`], verbatim; 0 — the ordinary case — means final
+    /// on broadcast.
+    ///
+    /// Signed, unconstrained by [`SignRequest::validate`], and invisible in the
+    /// amounts, yet it decides WHEN the transaction can be mined. dcrd reads it
+    /// as a block height below `txscript.LockTimeThreshold` (5e8) and as a Unix
+    /// timestamp at or above it. It only bites when
+    /// [`ReviewSummary::has_nonfinal_sequence`] is also true, so a device should
+    /// render the two together and warn on the combination.
+    pub lock_time: u32,
+    /// [`SignRequest::expiry`], verbatim; 0 = no expiry, the ordinary case.
+    ///
+    /// dcrd's `IsExpiredTx` makes the transaction invalid once the chain reaches
+    /// this height — a send that quietly stops being broadcastable.
+    pub expiry: u32,
+    /// True when ANY input's sequence is below [`MAX_TX_IN_SEQUENCE`], which is
+    /// the switch that arms [`ReviewSummary::lock_time`].
+    ///
+    /// A bool rather than the raw numbers on purpose: `validate` pins this
+    /// package to transaction version 1, and dcrd enforces relative (BIP68-style)
+    /// sequence locks only from version 2
+    /// (`internal/blockchain/sequencelock.go`), so the individual values carry no
+    /// other consensus meaning here and would be noise on a small screen.
+    pub has_nonfinal_sequence: bool,
 }
 // NOTE: `flagged_mismatches` was removed with the address scan. It reported
 // outputs the companion called change that the scan could not derive — a
@@ -707,6 +756,13 @@ impl SignRequest {
             input_total,
             output_total,
             fee: input_total - output_total,
+            // The rest of what `sign_request` writes into the signed bytes and
+            // `validate` does not constrain. `any` rather than the first input:
+            // dcrd's IsFinalizedTransaction requires EVERY input to be maxed
+            // out, so one lowered input makes the whole transaction non-final.
+            lock_time: self.lock_time,
+            expiry: self.expiry,
+            has_nonfinal_sequence: self.inputs.iter().any(|i| i.sequence != MAX_TX_IN_SEQUENCE),
         })
     }
 
