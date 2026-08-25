@@ -26,6 +26,13 @@ jobs:
   # builds this crate is aimed at without any signal here. The matrix
   # mirrors the test job because a feature-gated API is exactly where a
   # too-new call hides.
+  #
+  # `--locked` throughout, which is why Cargo.lock is committed. Resolving
+  # freely here would mean a dependency raising ITS floor turns this job red
+  # on an unrelated pull request, and the failure would surface from inside
+  # that dependency — exactly the confusing break this job exists to prevent.
+  # The `test` job below stays unlocked on purpose, so upstream breakage is
+  # still seen early; same split as `lint` (pinned) versus `lint-latest`.
   msrv:
     name: MSRV build (1.85)
     runs-on: ubuntu-latest
@@ -34,16 +41,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.85
         with:
           targets: thumbv7em-none-eabihf
-      - run: cargo check --all-targets --all-features
-      - run: cargo check --all-targets --no-default-features
-      - run: cargo check --all-targets --no-default-features --features mnemonic
-      - run: cargo check --all-targets --no-default-features --features airgap
-      - run: cargo check --all-targets --no-default-features --features mnemonic,airgap
+      - run: cargo check --locked --all-targets --all-features
+      - run: cargo check --locked --all-targets --no-default-features
+      - run: cargo check --locked --all-targets --no-default-features --features mnemonic
+      - run: cargo check --locked --all-targets --no-default-features --features airgap
+      - run: cargo check --locked --all-targets --no-default-features --features mnemonic,airgap
       # secp256k1-sys builds C for the target, so the cross-compiler has to be
       # here for the same reason the no-std job installs it. A host-only matrix
       # would miss an MSRV break that only bare metal reaches.
       - run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi
-      - run: cargo check --target thumbv7em-none-eabihf --no-default-features --features mnemonic,airgap
+      - run: cargo check --locked --target thumbv7em-none-eabihf --no-default-features --features mnemonic,airgap
 
   lint:
     runs-on: ubuntu-latest

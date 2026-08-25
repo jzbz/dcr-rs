@@ -87,6 +87,7 @@ use minicbor::{Decode, Encode};
 use secp256k1::{All, Secp256k1};
 
 use crate::address::{p2pkh_script, Address};
+use crate::blake256::sum256;
 use crate::hashing::hash160;
 use crate::hd::{ExtPrivKey, ExtPubKey, BRANCH_EXTERNAL, BRANCH_INTERNAL};
 use crate::sighash::prefix_hash_all;
@@ -469,7 +470,16 @@ impl SignRequest {
             ))?;
             let funding = MsgTx::parse_prefix(raw)
                 .map_err(|_| Error::InvalidRequest("unparseable prev_tx_prefix"))?;
-            if funding.tx_hash() != meta.prev_hash {
+            // `raw` IS serialize_prefix(funding), so hash it where it lies
+            // instead of rebuilding it. parse_prefix accepts only a NoWitness
+            // ser_type, canonical varints, and nothing trailing, so the prefix
+            // encoding of an accepted transaction is unique. Routing through
+            // funding.tx_hash() would allocate and fill a second full-size
+            // buffer for every input on every validate() call, and a normal
+            // flow calls validate() once per entry point. Loosening the parser
+            // later tightens this rather than breaking it: a non-canonical
+            // prefix would simply stop matching its declared txid.
+            if sum256(raw) != meta.prev_hash {
                 return Err(Error::InvalidRequest(
                     "prev_tx_prefix does not hash to the declared prevout",
                 ));

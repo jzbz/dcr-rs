@@ -86,10 +86,17 @@ curve math or standard KDFs.
 
 ## Usage
 
+Not on crates.io, so there is no version requirement to pin. Pin a revision
+instead — `master` moves, and a wallet's signing dependency should not change
+under it between builds:
+
 ```toml
 [dependencies]
-dcr-rs = { git = "https://github.com/jzbz/dcr-rs" }
+dcr-rs = { git = "https://github.com/jzbz/dcr-rs", rev = "391d831" }
 ```
+
+Use whichever revision you reviewed; the one above is only an example. Omitting
+`rev` tracks `master`, which is fine for experimenting and wrong for shipping.
 
 Addresses:
 
