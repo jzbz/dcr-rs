@@ -86,17 +86,18 @@ curve math or standard KDFs.
 
 ## Usage
 
-Not on crates.io, so there is no version requirement to pin. Pin a revision
+Not on crates.io, so there is no version requirement to pin. Pin a release tag
 instead — `master` moves, and a wallet's signing dependency should not change
 under it between builds:
 
 ```toml
 [dependencies]
-dcr-rs = { git = "https://github.com/jzbz/dcr-rs", rev = "391d831" }
+dcr-rs = { git = "https://github.com/jzbz/dcr-rs", tag = "v0.6.0" }
 ```
 
-Use whichever revision you reviewed; the one above is only an example. Omitting
-`rev` tracks `master`, which is fine for experimenting and wrong for shipping.
+Tags are signed. Where no tag exists, `rev = "<sha>"` pins a revision the same
+way; omitting both tracks `master`, which is fine for experimenting and wrong
+for shipping.
 
 Addresses:
 
