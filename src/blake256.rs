@@ -183,7 +183,14 @@ impl Blake256 {
             }
         }
 
-        // Full blocks straight from the input.
+        // Full blocks straight from the input. `compress` takes an array
+        // reference, so each block is staged through `b`. Passing
+        // `blk.try_into()` instead removes that copy from the source but not
+        // from the object code: LLVM elides it either way, and the emitted
+        // assembly is byte-identical on x86-64 and on thumbv7em-none-eabihf
+        // at the 1.85 MSRV. Left as written, mirroring the buffered path
+        // above — which cannot drop its copy, since `self.buf` is borrowed
+        // from the `self` that `compress` needs mutably.
         let mut chunks = data.chunks_exact(BLOCK_LEN);
         for blk in &mut chunks {
             self.compressed_bits += (BLOCK_LEN as u64) * 8;
