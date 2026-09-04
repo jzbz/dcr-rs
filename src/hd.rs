@@ -204,22 +204,29 @@ impl ExtPrivKey {
         let mut mac = HmacSha512::new_from_slice(b"Bitcoin seed").expect("hmac key");
         mac.update(seed);
         let mut i = mac.finalize().into_bytes();
-        let secret = SecretKey::from_slice(&i[..32]).map_err(|_| Error::Derivation)?;
-        let mut chain_code = [0u8; 32];
-        chain_code.copy_from_slice(&i[32..]);
+        // `i` is the master secret candidate ‖ chain code, so *every* exit has to
+        // wipe it. The fallible tail therefore runs inside a closure, the shape
+        // `parse_ext_key` uses for the same reason: written as a bare `?`, the
+        // invalid-scalar arm left the function before reaching the wipe below.
+        let key = (|| {
+            let secret = SecretKey::from_slice(&i[..32]).map_err(|_| Error::Derivation)?;
+            let mut chain_code = [0u8; 32];
+            chain_code.copy_from_slice(&i[32..]);
+            Ok(ExtPrivKey {
+                network,
+                secret,
+                chain_code,
+                depth: 0,
+                parent_fingerprint: [0; 4],
+                child_number: 0,
+                // dcrd `NewMaster` hands the full 32 HMAC bytes to `newExtendedKey`
+                // and nothing strips them, so a master whose key begins with a zero
+                // byte keeps it and derives its hardened children BIP32-style.
+                zeros_stripped: false,
+            })
+        })();
         i.zeroize(); // wipe the secret ‖ chain-code intermediate
-        Ok(ExtPrivKey {
-            network,
-            secret,
-            chain_code,
-            depth: 0,
-            parent_fingerprint: [0; 4],
-            child_number: 0,
-            // dcrd `NewMaster` hands the full 32 HMAC bytes to `newExtendedKey`
-            // and nothing strips them, so a master whose key begins with a zero
-            // byte keeps it and derives its hardened children BIP32-style.
-            zeros_stripped: false,
-        })
+        key
     }
 
     /// Derive the master key from BIP39 entropy (16–32 bytes) and passphrase,
@@ -334,28 +341,37 @@ impl ExtPrivKey {
         }
         let mut i = mac.finalize().into_bytes();
 
-        let tweak = child_tweak(<[u8; 32]>::try_from(&i[..32]).unwrap())?;
-        let secret = self.secret.add_tweak(&tweak);
+        // The intermediate's left half is the tweak that, together with the
+        // parent key, yields the child secret, so *every* exit has to wipe it.
+        // Both fallible steps therefore run inside a closure: `child_tweak`'s
+        // `?` used to leave the function before the wipe, and deferring
+        // `add_tweak`'s error past it only covered that one path — the child
+        // chain code copied out of `i` beforehand still dropped unwiped.
+        let key = (|| {
+            let tweak = child_tweak(<[u8; 32]>::try_from(&i[..32]).unwrap())?;
+            let secret = self
+                .secret
+                .add_tweak(&tweak)
+                .map_err(|_| Error::Derivation)?;
 
-        let mut chain_code = [0u8; 32];
-        chain_code.copy_from_slice(&i[32..]);
-        // Wipe the intermediate: its left half is the tweak that, together
-        // with the parent key, yields the child secret.
+            let mut chain_code = [0u8; 32];
+            chain_code.copy_from_slice(&i[32..]);
+
+            let h = crate::hashing::hash160(&parent_pubkey);
+            Ok(ExtPrivKey {
+                network: self.network,
+                secret,
+                chain_code,
+                depth,
+                parent_fingerprint: [h[0], h[1], h[2], h[3]],
+                child_number: index,
+                // dcrd strips the key it just produced only on the legacy path, so
+                // that is exactly when the child's stored form is the short one.
+                zeros_stripped: !strict_bip32,
+            })
+        })();
         i.zeroize();
-        let secret = secret.map_err(|_| Error::Derivation)?;
-
-        let h = crate::hashing::hash160(&parent_pubkey);
-        Ok(ExtPrivKey {
-            network: self.network,
-            secret,
-            chain_code,
-            depth,
-            parent_fingerprint: [h[0], h[1], h[2], h[3]],
-            child_number: index,
-            // dcrd strips the key it just produced only on the legacy path, so
-            // that is exactly when the child's stored form is the short one.
-            zeros_stripped: !strict_bip32,
-        })
+        key
     }
 
     /// Derive along `path` (each element optionally `| HARDENED`) with the Decred
@@ -530,25 +546,33 @@ impl ExtPubKey {
         let mut mac = HmacSha512::new_from_slice(&self.chain_code).expect("hmac key");
         mac.update(&self.compressed_pubkey());
         mac.update(&index.to_be_bytes());
-        let i = mac.finalize().into_bytes();
+        let mut i = mac.finalize().into_bytes();
 
-        let tweak = child_tweak(<[u8; 32]>::try_from(&i[..32]).unwrap())?;
-        let public_key = self
-            .public_key
-            .add_exp_tweak(secp, &tweak)
-            .map_err(|_| Error::Derivation)?;
+        // Nothing here is secret — an `ExtPubKey` carries its own chain code in
+        // the clear and both halves of `i` are recomputable from it — but the
+        // private path's discipline is cheaper to hold everywhere than to
+        // reason about per call site, so this exit wipes too, on every path.
+        let key = (|| {
+            let tweak = child_tweak(<[u8; 32]>::try_from(&i[..32]).unwrap())?;
+            let public_key = self
+                .public_key
+                .add_exp_tweak(secp, &tweak)
+                .map_err(|_| Error::Derivation)?;
 
-        let mut chain_code = [0u8; 32];
-        chain_code.copy_from_slice(&i[32..]);
+            let mut chain_code = [0u8; 32];
+            chain_code.copy_from_slice(&i[32..]);
 
-        Ok(ExtPubKey {
-            network: self.network,
-            public_key,
-            chain_code,
-            depth,
-            parent_fingerprint: self.fingerprint(),
-            child_number: index,
-        })
+            Ok(ExtPubKey {
+                network: self.network,
+                public_key,
+                chain_code,
+                depth,
+                parent_fingerprint: self.fingerprint(),
+                child_number: index,
+            })
+        })();
+        i.zeroize();
+        key
     }
 
     /// Derive along `path` (non-hardened indices only).
