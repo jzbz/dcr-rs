@@ -621,17 +621,26 @@ impl ExtPubKey {
     /// form, which dcrd accepts under a `dpub…` version and hands back as a
     /// private key. As there, no expected network is passed in.
     pub fn from_base58(s: &str) -> Result<Self, Error> {
-        let raw = parse_ext_key(s)?;
-        let network = Network::from_hd_pub_id(raw.version).ok_or(Error::UnknownPrefix)?;
-        let public_key = PublicKey::from_slice(&raw.key_data).map_err(|_| Error::Parse)?;
-        Ok(ExtPubKey {
-            network,
-            public_key,
-            chain_code: raw.chain_code,
-            depth: raw.depth,
-            parent_fingerprint: raw.parent_fingerprint,
-            child_number: raw.child_number,
-        })
+        let mut raw = parse_ext_key(s)?;
+        let result = (|| {
+            let network = Network::from_hd_pub_id(raw.version).ok_or(Error::UnknownPrefix)?;
+            let public_key = PublicKey::from_slice(&raw.key_data).map_err(|_| Error::Parse)?;
+            Ok(ExtPubKey {
+                network,
+                public_key,
+                chain_code: raw.chain_code,
+                depth: raw.depth,
+                parent_fingerprint: raw.parent_fingerprint,
+                child_number: raw.child_number,
+            })
+        })();
+        // Both errors above are raised BY a private key: a `dprv…` fails the
+        // version check, and the 0x00-prefixed private form under a `dpub…`
+        // version fails `PublicKey::from_slice` (the case the doc comment
+        // describes). So the slot holds a raw secret on exactly the paths that
+        // leave early — wipe it either way, as `ExtPrivKey::from_base58` does.
+        raw.key_data.zeroize();
+        result
     }
 }
 
