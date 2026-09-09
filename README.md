@@ -92,7 +92,7 @@ under it between builds:
 
 ```toml
 [dependencies]
-dcr-rs = { git = "https://github.com/jzbz/dcr-rs", tag = "v0.6.0" }
+dcr-rs = { git = "https://github.com/jzbz/dcr-rs", tag = "v0.6.1" }
 ```
 
 Tags are signed. Where no tag exists, `rev = "<sha>"` pins a revision the same

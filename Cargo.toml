@@ -7,7 +7,7 @@
 
 [package]
 name = "dcr-rs"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 # Set by the dependency floor, not by this crate's own source: zeroize 1.9 and
 # zeroize_derive 1.5 declare 1.85. Embedded targets often sit on a pinned
