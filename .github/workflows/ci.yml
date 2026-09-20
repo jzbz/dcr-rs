@@ -12,7 +12,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --all-features
       - run: cargo test --no-default-features
@@ -37,7 +37,7 @@ jobs:
     name: MSRV build (1.85)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.85
         with:
           targets: thumbv7em-none-eabihf
@@ -55,7 +55,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Pinned rather than floating: `-D warnings` on a channel that gains
       # lints every six weeks turns pull requests red for reasons their
       # author did not cause. Bump this deliberately, the way the MSRV is
@@ -73,7 +73,7 @@ jobs:
     # without blocking anything in the meantime.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -84,7 +84,7 @@ jobs:
   no-std:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: thumbv7em-none-eabihf
