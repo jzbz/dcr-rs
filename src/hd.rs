@@ -39,7 +39,9 @@
 //! * the master is never stripped — `NewMaster` stores the full 32 HMAC bytes;
 //! * a key from `NewKeyFromString` is never stripped — a serialized extended
 //!   key is zero-padded to 32 bytes, so a round trip restores the padded form
-//!   and CHANGES that key's hardened children;
+//!   and CHANGES the hardened children of a key `child()` had stored stripped
+//!   (one that began with a zero byte, ~1 in 256). Every other key round-trips
+//!   exactly;
 //! * `strictBIP32` decides whether the CHILD is stored stripped; the preimage
 //!   layout comes from how the PARENT already was. A strict child of a stripped
 //!   parent therefore still sees the short form.
@@ -449,6 +451,11 @@ impl ExtPrivKey {
     }
 
     /// Serialize as a `dprv…`/`tprv…`/`sprv…`/`rprv…` extended private key.
+    ///
+    /// # Round trips are not derivation-neutral
+    ///
+    /// Parsing this string back with [`ExtPrivKey::from_base58`] can give a key
+    /// whose hardened children differ from this one's. See that function.
     pub fn to_base58(&self) -> String {
         serialize_ext_key(
             self.network.hd_priv_id(),
@@ -470,6 +477,20 @@ impl ExtPrivKey {
     /// expected network is passed in, so where dcrd answers `ErrWrongNetwork`
     /// for a foreign prefix this returns the key with its own [`Network`]: a
     /// caller that accepts only one network has to compare the field itself.
+    ///
+    /// # Round trips are not derivation-neutral
+    ///
+    /// A key [`derive_child`](ExtPrivKey::derive_child) produced with a leading
+    /// zero byte (about 1 in 256) is stored stripped, and its hardened children
+    /// depend on that. The string form zero-pads, so the key parsed back here is
+    /// unstripped and its hardened children differ from the original's. This
+    /// mirrors dcrd `NewKeyFromString`. A master key, a
+    /// [`derive_child_bip32_std`](ExtPrivKey::derive_child_bip32_std) output and
+    /// a key parsed here are never stored stripped and round-trip exactly, but
+    /// the string does not say which kind it came from. Non-hardened children,
+    /// and every [`ExtPubKey`], are unaffected. Where a key must reproduce a
+    /// wallet's hardened descendants, derive it from the seed rather than
+    /// restoring it from its `dprv`.
     pub fn from_base58(s: &str) -> Result<Self, Error> {
         let mut raw = parse_ext_key(s)?;
         let result = (|| {

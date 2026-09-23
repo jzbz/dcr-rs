@@ -8,7 +8,7 @@
 //! no transaction-construction policy.
 //!
 //! EC math, HMAC/SHA/RIPEMD, BIP39 wordlists, base58 and CBOR are delegated to
-//! audited crates. The only Decred-specific cryptographic primitive vendored
+//! widely used crates. The only Decred-specific cryptographic primitive vendored
 //! here is BLAKE-256 (the 14-round SHA-3 finalist Decred uses for
 //! *everything*, not BLAKE2/3), implemented in [`blake256`] and checked
 //! against dcrd-generated known-answer vectors.
@@ -32,6 +32,12 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// Links to feature-gated items dangle when those features are off. The
+// all-features doc build is where a genuinely broken link is caught.
+#![cfg_attr(
+    not(all(feature = "mnemonic", feature = "airgap")),
+    allow(rustdoc::broken_intra_doc_links)
+)]
 
 extern crate alloc;
 

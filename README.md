@@ -41,8 +41,10 @@ against the local dcrd `hdkeychain` over 200 000 seeds, the account key at
 Stripping is a property of the STORED key rather than of the derivation being
 performed — in dcrd it is `[]byte` length, and only `child()` ever strips, only
 the key it has just produced. So the master is never stripped; a key reparsed
-from its `dprv` is never stripped, because serialization zero-pads, and a round
-trip therefore changes that key's hardened children; and `strictBIP32` decides
+from its `dprv` is never stripped, because serialization zero-pads, so a round
+trip changes the hardened children of a key that was stored stripped (a
+`derive_child` output beginning with a zero byte, about 1 in 256) and of no
+other; and `strictBIP32` decides
 how the CHILD is stored, while the preimage layout comes from how the PARENT
 already was.
 
@@ -72,7 +74,7 @@ Out of scope: networking/RPC, staking, mixing, and transaction-construction
 policy (coin selection, fees).
 
 Elliptic-curve math, HMAC/SHA/RIPEMD, BIP39 wordlists, base58 and CBOR are
-delegated to audited crates ([`secp256k1`], [`sha2`], [`hmac`], [`ripemd`],
+delegated to widely used crates ([`secp256k1`], [`sha2`], [`hmac`], [`ripemd`],
 [`bip39`], [`bs58`], [`minicbor`]); this crate hand-rolls nothing that touches
 curve math or standard KDFs.
 
@@ -86,18 +88,30 @@ curve math or standard KDFs.
 
 ## Usage
 
-Not on crates.io, so there is no version requirement to pin. Pin a release tag
-instead — `master` moves, and a wallet's signing dependency should not change
-under it between builds:
+```toml
+[dependencies]
+dcr-rs = "0.6"
+```
+
+A published version never changes, and `Cargo.lock` records each one's
+checksum, so committing the lockfile is what keeps a wallet's signing
+dependency from moving under it between builds.
+
+Every published version is cut from a signed tag, and the `.crate` records the
+commit it was packaged from in `.cargo_vcs_info.json`. The tag's GitHub release
+carries a `SHA256SUMS` covering the published `.crate`, signed with PGP key
+`252B 901C 8885 3CF9 F939  2559 2497 38C8 641C 3359`, so the bytes crates.io
+serves can be checked against that key rather than only the registry's word.
+
+To depend on the signed tag directly instead:
 
 ```toml
 [dependencies]
-dcr-rs = { git = "https://github.com/jzbz/dcr-rs", tag = "v0.6.1" }
+dcr-rs = { git = "https://github.com/jzbz/dcr-rs", tag = "v0.6.2" }
 ```
 
-Tags are signed. Where no tag exists, `rev = "<sha>"` pins a revision the same
-way; omitting both tracks `master`, which is fine for experimenting and wrong
-for shipping.
+Use one source per dependency graph. A git `dcr-rs` and a registry `dcr-rs` are
+different packages to Cargo, and their types do not unify.
 
 Addresses:
 
@@ -151,6 +165,27 @@ each input's amount against the funding transaction the package carries — and
 re-derives ownership from the device's own key. None of them trusts the previous
 one having been called, so skipping a step weakens the UI, never the signing
 guarantees.
+
+## Versioning
+
+Pre-1.0, so under Cargo's rules the minor version is the breaking one: `0.6.x`
+releases are compatible with each other and `0.7.0` need not be. These bump the
+minor even when no Rust signature moves:
+
+- **A change to any derived key or address.** A restored seed has to produce
+  the same wallet on every version that claims compatibility.
+- **The airgap wire format.** The decoder accepts exactly one
+  `airgap::FORMAT_VERSION`, so a signer and a companion on different minors
+  may stop understanding each other.
+- **A policy constant's value** — `MAX_INPUTS`, `MAX_OUTPUTS`,
+  `MAX_PACKAGE_BYTES`, `FEE_ALWAYS_ALLOWED_ATOMS`, `MAX_FEE_FRACTION_DIVISOR`.
+  A device's accept/refuse behaviour is built on them.
+- **A semver-incompatible `secp256k1`.** It is re-exported and its types appear
+  in this crate's signatures, so its semver-compatible range (currently
+  `0.29`) is part of this crate's API.
+
+Raising `rust-version` also takes a minor release. Changes are listed in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Feature flags
 
@@ -233,6 +268,7 @@ overflow-checks = true
 ```
 
 This library has **not** been independently audited. Use at your own risk.
+Report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
 
 ## License
 

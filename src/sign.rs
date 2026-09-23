@@ -47,7 +47,8 @@ pub fn sign_p2pkh_input(
 
 /// [`sign_p2pkh_input`] with the input-independent prefix hash supplied by the
 /// caller (see [`prefix_hash_all`]). Signing every input of an N-input
-/// transaction this way is O(N) rather than O(N²).
+/// transaction this way hashes the prefix once rather than N times; the
+/// per-input witness hash still grows with N.
 pub fn sign_p2pkh_input_cached(
     secp: &Secp256k1<All>,
     tx: &MsgTx,

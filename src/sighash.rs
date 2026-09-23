@@ -35,8 +35,10 @@ const SIGHASH_SERIALIZE_WITNESS: u32 = 3;
 ///    script (those live in the witness), so it is invariant while a tx is
 ///    being signed input by input.
 ///
-/// Compute it once and pass it to [`signature_hash_all_cached`] to sign a
-/// transaction in O(N) instead of O(N²).
+/// Compute it once and pass it to [`signature_hash_all_cached`], as dcrd's
+/// `cachedPrefix` does, so signing each input stops re-serializing and
+/// re-hashing the whole prefix. The witness half still covers every input, so
+/// signing all N inputs remains O(N²), with a far smaller constant.
 pub fn prefix_hash_all(tx: &MsgTx) -> [u8; 32] {
     tx.tx_hash()
 }

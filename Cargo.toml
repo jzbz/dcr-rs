@@ -1,13 +1,13 @@
 # dcr-rs
 #
 # The hard rule here: we hand-roll NOTHING that touches elliptic-curve math or
-# standard KDFs. Those come from audited crates. We only own Decred-specific
+# standard KDFs. Those come from widely used crates. We only own Decred-specific
 # glue (BLAKE-256, sighash byte layout, tx serialization, address encoding,
 # derivation orchestration, airgap format).
 
 [package]
 name = "dcr-rs"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 # Set by the dependency floor, not by this crate's own source: zeroize 1.9 and
 # zeroize_derive 1.5 declare 1.85. Embedded targets often sit on a pinned
@@ -16,11 +16,14 @@ edition = "2021"
 # the whole feature matrix and the bare-metal target against it, so the number
 # is checked rather than merely declared.
 rust-version = "1.85"
-description = "Decred (DCR) primitives: BLAKE-256, addresses, HD keys, transaction wire format, and SigHashAll signing"
+description = "Decred (DCR) primitives: BLAKE-256, addresses, dcrd-compatible HD keys, transaction wire format, and SigHashAll signing"
 license = "ISC"
 repository = "https://github.com/jzbz/dcr-rs"
 keywords = ["decred", "dcr", "cryptocurrency", "blake256", "bip32"]
 categories = ["cryptography::cryptocurrencies", "no-std"]
+# An allow-list rather than an exclude list: a published version can never be
+# deleted, so a file that lands in the tree must not ship by default.
+include = ["/src", "/tests", "/README.md", "/LICENSE", "/CHANGELOG.md", "/SECURITY.md"]
 
 [features]
 default = ["std", "mnemonic", "airgap"]

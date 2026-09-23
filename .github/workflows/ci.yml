@@ -90,3 +90,30 @@ jobs:
           targets: thumbv7em-none-eabihf
       - run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi
       - run: cargo check --target thumbv7em-none-eabihf --no-default-features --features mnemonic,airgap
+
+  # A published version is immutable, so a packaging mistake is only fixable
+  # by releasing again. Build the .crate and compile it from its own
+  # contents, exactly as `cargo publish` would, on every change instead.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo package --locked
+
+  # docs.rs builds once per version and never again, so a rustdoc failure
+  # there stays on the crate's page until the next release. The reduced-
+  # feature builds are the ones default-features = false consumers see.
+  # Pinned for the same reason lint is: -D warnings on a floating channel.
+  docs:
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - run: cargo doc --no-deps --all-features
+      - run: cargo doc --no-deps --no-default-features
+      - run: cargo doc --no-deps --no-default-features --features mnemonic
+      - run: cargo doc --no-deps --no-default-features --features airgap
+      - run: cargo doc --no-deps --no-default-features --features mnemonic,airgap
