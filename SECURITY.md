@@ -40,12 +40,15 @@ existing `Cargo.lock`; the advisory is what reaches those builds.
 
 `ExtPrivKey` secrets and chain codes, and BIP39 mnemonics, are overwritten on
 drop. BIP32 HMAC outputs, the BIP39 seed this crate expands, and the buffers
-used to serialize and parse `dprv` strings are overwritten once used. None of
-that reaches copies made elsewhere: a value a by-value call has already
-copied, the internal state of the HMAC-SHA512 and PBKDF2 implementations that
-process seeds, mnemonics and parent secrets, or the `dprv` string `to_base58`
-returns, which is the caller's to wipe. It shrinks the window; it does not
-close it.
+used to serialize and parse `dprv` strings are overwritten once used. The
+HMAC-SHA512 implementation that processes seeds and parent secrets wipes its
+hash states, block buffer and output on drop, but not temporaries inside its
+own functions, such as the padded key, the inner hash and SHA-512's message
+schedule, which holds each block it hashes, the seed or a parent private key
+among them. None of that reaches copies made elsewhere: a value a by-value
+call has already copied, the internal state of the PBKDF2 implementation that
+expands mnemonics, or the `dprv` string `to_base58` returns, which is the
+caller's to wipe. It shrinks the window; it does not close it.
 
 ### No constant-time guarantees for Decred-specific code
 

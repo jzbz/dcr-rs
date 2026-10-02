@@ -74,7 +74,7 @@ use alloc::vec::Vec;
 
 #[cfg(feature = "mnemonic")]
 use bip39::Mnemonic;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use secp256k1::{All, PublicKey, Scalar, Secp256k1, SecretKey};
 use sha2::Sha512;
 

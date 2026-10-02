@@ -9,12 +9,17 @@
 name = "dcr-rs"
 version = "0.6.2"
 edition = "2021"
-# Set by the dependency floor, not by this crate's own source: zeroize 1.9 and
-# zeroize_derive 1.5 declare 1.85. Embedded targets often sit on a pinned
-# toolchain, so state it rather than letting the failure surface from inside a
-# dependency. Lowering it means capping `zeroize` at 1.8. CI's msrv job builds
-# the whole feature matrix and the bare-metal target against it, so the number
-# is checked rather than merely declared.
+# Set by the dependency floor, not by this crate's own source: zeroize 1.9,
+# zeroize_derive 1.5 and the digest 0.11 hashes (sha2 0.11, hmac 0.13,
+# ripemd 0.2) declare 1.85. Embedded targets often sit on a pinned toolchain,
+# so state it rather than letting the failure surface from inside a
+# dependency. Lowering it means capping `zeroize` at 1.8 and going back to
+# sha2 0.10, hmac 0.12 and ripemd 0.1, which have no `zeroize` feature, so
+# HMAC state would no longer be wiped. The digest 0.11 crates allow MSRV bumps
+# in patch releases, so a fresh resolve can still pick up one that needs a
+# newer toolchain. CI's msrv job builds the whole feature matrix and the
+# bare-metal target against Cargo.lock, so the number is checked rather than
+# merely declared.
 rust-version = "1.85"
 description = "Decred (DCR) primitives: BLAKE-256, addresses, dcrd-compatible HD keys, transaction wire format, and SigHashAll signing"
 license = "ISC"
@@ -29,12 +34,12 @@ include = ["/src", "/tests", "/README.md", "/LICENSE", "/CHANGELOG.md", "/SECURI
 default = ["std", "mnemonic", "airgap"]
 # Links std into dependencies and implements std::error::Error. Disable for
 # no_std targets (the crate itself only ever needs `alloc`).
+#
+# sha2, hmac and ripemd are absent because from the digest 0.11 family on they
+# have no `std` feature; they are `no_std` with nothing to link.
 std = [
     "secp256k1/std",
     "bs58/std",
-    "sha2/std",
-    "hmac/std",
-    "ripemd/std",
     "bip39?/std",
     "minicbor?/std",
 ]
@@ -46,9 +51,18 @@ airgap = ["dep:minicbor"]
 
 [dependencies]
 secp256k1 = { version = "0.29", default-features = false, features = ["alloc"] }
-sha2 = { version = "0.10", default-features = false }
-hmac = { version = "0.12", default-features = false }
-ripemd = { version = "0.1", default-features = false }
+# `zeroize` wipes hash and HMAC state when it is dropped, which these crates do
+# not do by default. Once derivation finalizes its HMAC-SHA512, the outer
+# SHA-512 state holds the whole 64-byte output (the master secret or child
+# tweak, and the chain code), and the inner state and the block buffer hold the
+# inner hash; the MAC output value carries the same 64 bytes. Temporaries
+# inside these crates' own functions, such as hmac's padded key and inner hash
+# and SHA-512's message schedule (which sees the seed and parent private keys),
+# are not covered. RIPEMD-160 only ever hashes public keys and scripts; its
+# feature is on so that every hasher here wipes the same way.
+sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }
+hmac = { version = "0.13", default-features = false, features = ["zeroize"] }
+ripemd = { version = "0.2", default-features = false, features = ["zeroize"] }
 bs58 = { version = "0.5", default-features = false, features = ["alloc"] }
 # `alloc` is a DEFAULT feature of zeroize that carries `impl Zeroize for Vec<T>`.
 # Without it `vec.zeroize()` silently resolves to the `[T]` impl via deref, which

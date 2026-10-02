@@ -5,6 +5,27 @@ Notable changes per release. Dates are release dates; for versions before
 
 This library has **not** been independently audited. See [SECURITY.md](SECURITY.md).
 
+## Unreleased
+
+Key hygiene. No API or behaviour change: derived keys, addresses and
+serializations are byte-identical to 0.6.2.
+
+- HMAC-SHA512 wipes its state on drop. The hashes move to the digest 0.11
+  family (sha2 0.11, hmac 0.13, ripemd 0.2) with their `zeroize` features on.
+  After finalization the HMAC's outer SHA-512 state holds the whole 64-byte
+  output (the master secret or child tweak, and the chain code), and its inner
+  state and block buffer hold the inner hash; 0.6.2 dropped all of it without
+  clearing it. Those states, the block buffer and the MAC output are now
+  overwritten when derivation drops them. Temporaries inside those crates' own
+  functions, such as HMAC's padded key and inner hash and SHA-512's message
+  schedule, are still not reached.
+- digest 0.10 and generic-array leave the dependency tree. A dependent that
+  still uses the 0.10 family elsewhere builds both. The MSRV stays 1.85, which
+  is what the new crates declare; they allow MSRV bumps in patch releases, so a
+  fresh resolve on 1.85 can pick up a patch release that needs a newer
+  toolchain.
+- `Cargo.lock` is refreshed to the latest semver-compatible versions.
+
 ## 0.6.2 — 2026-09-22
 
 The first release published to crates.io. No API or behaviour change from
